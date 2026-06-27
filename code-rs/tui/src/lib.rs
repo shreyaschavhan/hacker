@@ -88,6 +88,7 @@ mod remote_model_presets;
 mod markdown_stream;
 mod syntax_highlight;
 pub mod onboarding;
+mod probe_review;
 pub mod public_widgets;
 mod render;
 mod model_migration;

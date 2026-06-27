@@ -2009,6 +2009,9 @@ impl ModelClient {
             .clone()
             .or_else(|| find_family_for_model(model_slug))
             .unwrap_or_else(|| self.config.model_family.clone());
+        let store = should_store_responses(prompt, &self.provider, &family);
+        let mut compact_input = prompt.input.clone();
+        prepare_response_items_for_request(&mut compact_input, store);
         let session_id = prompt.session_id_override.unwrap_or(self.session_id);
         let session_id_str = session_id.to_string();
         let instructions = prompt.get_full_instructions(&family).into_owned();
@@ -2030,7 +2033,7 @@ impl ModelClient {
             };
             let payload = CompactHistoryRequest {
                 model: model_slug,
-                input: &prompt.input,
+                input: &compact_input,
                 instructions: instructions.clone(),
                 service_tier,
                 prompt_cache_key: Some(session_id_str.as_str()),
@@ -3206,14 +3209,18 @@ async fn stream_from_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ConfigOverrides, ConfigToml};
     use crate::model_family::derive_default_model_family;
     use crate::model_provider_info::{ModelProviderInfo, WireApi};
+    use tempfile::TempDir;
     use std::collections::HashMap;
     use serde_json::json;
     use tokio::sync::mpsc;
     use tokio_test::io::Builder as IoBuilder;
     use tokio_util::io::ReaderStream;
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ────────────────────────────
     // Helpers
@@ -3275,6 +3282,93 @@ mod tests {
         }
     }
 
+    fn test_model_client(base_url: String) -> (ModelClient, TempDir) {
+        let code_home = TempDir::new().expect("temp code home");
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides {
+                model: Some("gpt-test".to_string()),
+                ..Default::default()
+            },
+            code_home.path().to_path_buf(),
+        )
+        .expect("test config");
+        let effort = config.model_reasoning_effort;
+        let summary = config.model_reasoning_summary;
+        let verbosity = config.model_text_verbosity;
+        let mut provider = responses_test_provider("openai", WireApi::Responses);
+        provider.base_url = Some(base_url);
+        let debug_logger = Arc::new(Mutex::new(DebugLogger::new(false).expect("debug logger")));
+
+        (
+            ModelClient::new(
+                Arc::new(config),
+                None,
+                None,
+                provider,
+                effort,
+                summary,
+                verbosity,
+                Uuid::new_v4(),
+                debug_logger,
+            ),
+            code_home,
+        )
+    }
+
+    fn compact_prompt_with_reasoning_id(store: bool) -> Prompt {
+        let mut prompt = Prompt::default();
+        prompt.store = store;
+        prompt.model_override = Some("gpt-test".to_string());
+        prompt.input = vec![
+            ResponseItem::Message {
+                id: Some("msg_123".to_string()),
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "assistant text".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::Reasoning {
+                id: Some("rs_123".to_string()),
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: Some("encrypted".to_string()),
+            },
+            ResponseItem::FunctionCall {
+                id: Some("fc_123".to_string()),
+                name: "shell".to_string(),
+                namespace: None,
+                arguments: "{}".to_string(),
+                call_id: "call_123".to_string(),
+            },
+        ];
+        prompt
+    }
+
+    async fn capture_compact_request_body(prompt: Prompt) -> serde_json::Value {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses/compact"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "output": [] })))
+            .mount(&server)
+            .await;
+
+        let (client, _code_home) = test_model_client(server.uri());
+        client
+            .compact_conversation_history(&prompt)
+            .await
+            .expect("compact should succeed");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("received requests");
+        assert_eq!(requests.len(), 1, "expected one compact request");
+        serde_json::from_slice(&requests[0].body).expect("request JSON")
+    }
+
     #[test]
     fn responses_storage_honors_explicit_prompt_store() {
         let provider = responses_test_provider("openai", WireApi::Responses);
@@ -3334,6 +3428,42 @@ mod tests {
         assert!(
             !serialized.to_string().contains("\"id\""),
             "non-stored Responses requests must not replay server item IDs: {serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_request_strips_item_ids_when_responses_are_not_stored() {
+        let body = capture_compact_request_body(compact_prompt_with_reasoning_id(false)).await;
+        let input = body
+            .get("input")
+            .expect("compact payload should include input");
+        let serialized_input = input.to_string();
+
+        assert!(
+            !serialized_input.contains("\"id\""),
+            "store=false compact must not reference non-persisted response items: {body}"
+        );
+        assert!(
+            !serialized_input.contains("rs_123"),
+            "store=false compact leaked reasoning item id: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_request_preserves_item_ids_when_responses_are_stored() {
+        let body = capture_compact_request_body(compact_prompt_with_reasoning_id(true)).await;
+        let input = body
+            .get("input")
+            .expect("compact payload should include input")
+            .to_string();
+
+        assert!(
+            input.contains("rs_123"),
+            "store=true compact should preserve persisted reasoning item ids: {body}"
+        );
+        assert!(
+            input.contains("msg_123"),
+            "store=true compact should preserve persisted message ids: {body}"
         );
     }
 

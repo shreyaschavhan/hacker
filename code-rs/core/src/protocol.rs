@@ -1524,6 +1524,7 @@ pub struct AgentStatusUpdateEvent {
 pub enum AgentSourceKind {
     Default,
     AutoReview,
+    ProbeReview,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

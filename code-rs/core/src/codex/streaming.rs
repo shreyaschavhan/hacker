@@ -11731,11 +11731,17 @@ fn is_terminal_agent_status(status: &str) -> bool {
 }
 
 fn is_auto_review_agent_info(agent: &crate::protocol::AgentInfo) -> bool {
-    matches!(agent.source_kind, Some(AgentSourceKind::AutoReview))
+    matches!(
+        agent.source_kind,
+        Some(AgentSourceKind::AutoReview | AgentSourceKind::ProbeReview)
+    )
         || agent
             .batch_id
             .as_deref()
-            .map(|batch| batch.eq_ignore_ascii_case("auto-review"))
+            .map(|batch| {
+                batch.eq_ignore_ascii_case("auto-review")
+                    || batch.eq_ignore_ascii_case("probe-review")
+            })
             .unwrap_or(false)
 }
 
@@ -11968,6 +11974,18 @@ mod agent_completion_wake_tests {
             task: None,
         };
         assert!(agent_completion_wake_messages(&auto_review, &mut state).is_empty());
+
+        let probe_review = AgentStatusUpdatePayload {
+            agents: vec![agent_info(
+                "agent-4",
+                "completed",
+                Some("probe-review"),
+                Some(AgentSourceKind::ProbeReview),
+            )],
+            context: None,
+            task: None,
+        };
+        assert!(agent_completion_wake_messages(&probe_review, &mut state).is_empty());
     }
 
     #[test]

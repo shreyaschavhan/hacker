@@ -25,6 +25,31 @@ The model that Code should use.
 model = "o3"  # overrides the default of "gpt-5.1-codex"
 ```
 
+## probe_review
+
+ProcessProbe automatically reviews high-risk AI conclusions and process failures. It is separate from file-diff Auto Review: it does not require code edits and runs when the assistant makes consequential claims such as fixed, verified, complete, safe, refuted, confirmed, or report-ready.
+
+```toml
+[probe_review]
+enabled = true
+mode = "high_risk"
+default_profile = "general"
+cheap_gate = true
+full_probe_threshold = "high"
+auto_resolve = true
+use_chat_model = false
+model = ""                    # empty: fall back to auto_review_model, review_model, then chat model
+model_reasoning_effort = "high"
+```
+
+Modes:
+
+- `high_risk` runs only when a cheap gate sees a high-risk process/conclusion signal.
+- `manual` runs only when the assistant/user text contains a force phrase such as `force probe`, `probe this`, or `review my reasoning`.
+- `always` runs whenever the cheap trigger detector sees a probe-worthy conclusion.
+
+Probe review is read-only. If the probe result requires resolution, Code injects a post-turn developer instruction asking the main agent to resolve or downgrade the conclusion before treating it as stable.
+
 ## model_providers
 
 This option lets you override and amend the default set of model providers bundled with Code. This value is a map where the key is the value to use with `model_provider` to select the corresponding provider. Providers must expose an OpenAI-compatible HTTP API (Chat Completions or Responses); native Anthropic/Gemini APIs are not supported directly without a proxy.

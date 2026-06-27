@@ -43,6 +43,8 @@ use std::time::Instant;
 /// If the pasted content exceeds this number of characters, replace it with a
 /// placeholder in the UI.
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
+const STATUS_STILL_WORKING_AFTER: Duration = Duration::from_secs(30);
+const STATUS_INTERRUPT_HINT_AFTER: Duration = Duration::from_secs(90);
 
 struct PostPasteSpaceGuard {
     expires_at: Instant,
@@ -176,6 +178,7 @@ pub(crate) struct ChatComposer {
     is_task_running: bool,
     // Current status message to display when task is running
     status_message: String,
+    status_started_at: Option<Instant>,
     // Animation thread for spinning icon when task is running
     animation_running: Option<Arc<AtomicBool>>,
     using_chatgpt_auth: bool,
@@ -251,6 +254,7 @@ impl ChatComposer {
             // no double‑Esc handling here; App manages Esc policy
             is_task_running: false,
             status_message: String::from("coding"),
+            status_started_at: None,
             animation_running: None,
             using_chatgpt_auth,
             custom_prompts: Vec::new(),
@@ -316,9 +320,16 @@ impl ChatComposer {
     }
 
     pub fn set_task_running(&mut self, running: bool) {
+        let was_running = self.is_task_running;
         self.is_task_running = running;
 
         if running {
+            if !was_running {
+                self.status_started_at = Some(Instant::now());
+            } else if self.status_started_at.is_none() {
+                self.status_started_at = Some(Instant::now());
+            }
+
             // Start animation thread if not already running
             if self.animation_running.is_none() {
                 let animation_flag = Arc::new(AtomicBool::new(true));
@@ -337,6 +348,7 @@ impl ChatComposer {
                     // Clamp to a sane floor so we never busy loop if a custom spinner
                     // has an extremely small interval configured.
                     let min_ms: u64 = 60; // ~16 FPS upper bound for this thread
+                    let max_ms: u64 = 1_000; // keep elapsed text visibly fresh
 
                     // Determine the target period. If the user changes the spinner
                     // while running, we'll still get correct visual output because
@@ -345,6 +357,7 @@ impl ChatComposer {
                     let period_ms = crate::spinner::current_spinner()
                         .interval_ms
                         .max(min_ms)
+                        .min(max_ms)
                         .max(1);
                     let period = Duration::from_millis(period_ms); // fallback uses default below if needed
 
@@ -379,6 +392,7 @@ impl ChatComposer {
                 }
             }
         } else {
+            self.status_started_at = None;
             // Stop animation thread
             if let Some(animation_flag) = self.animation_running.take() {
                 animation_flag.store(false, Ordering::Relaxed);
@@ -387,7 +401,46 @@ impl ChatComposer {
     }
 
     pub fn update_status_message(&mut self, message: String) {
-        self.status_message = Self::map_status_message(&message);
+        let mapped = Self::map_status_message(&message);
+        if mapped != self.status_message {
+            self.status_message = mapped;
+            self.status_started_at = self.is_task_running.then(Instant::now);
+        } else if self.is_task_running && self.status_started_at.is_none() {
+            self.status_started_at = Some(Instant::now());
+        }
+    }
+
+    fn format_running_elapsed(duration: Duration) -> String {
+        let total_secs = duration.as_secs();
+        let hours = total_secs / 3600;
+        let minutes = (total_secs % 3600) / 60;
+        let seconds = total_secs % 60;
+        if hours > 0 {
+            format!("{hours}:{minutes:02}:{seconds:02}")
+        } else {
+            format!("{minutes}:{seconds:02}")
+        }
+    }
+
+    fn running_title_text(&self, now: Instant) -> String {
+        let status = if self.status_message.trim().is_empty() {
+            "Working"
+        } else {
+            self.status_message.trim()
+        };
+        let elapsed = self
+            .status_started_at
+            .map(|started| now.saturating_duration_since(started))
+            .unwrap_or_default();
+        let elapsed_text = Self::format_running_elapsed(elapsed);
+
+        if elapsed >= STATUS_INTERRUPT_HINT_AFTER {
+            format!("{status}... Still working; Ctrl+C to interrupt {elapsed_text}")
+        } else if elapsed >= STATUS_STILL_WORKING_AFTER {
+            format!("{status}... Still working {elapsed_text}")
+        } else {
+            format!("{status}... {elapsed_text}")
+        }
     }
 
     pub fn status_message(&self) -> Option<&str> {
@@ -2924,21 +2977,20 @@ impl WidgetRef for ChatComposer {
                     }
                 }
             } else {
-                use std::time::{SystemTime, UNIX_EPOCH};
+                use std::time::{Instant, SystemTime, UNIX_EPOCH};
+                let now_instant = Instant::now();
                 let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis();
                 let def = crate::spinner::current_spinner();
                 let spinner_str = crate::spinner::frame_at_time(def, now_ms);
+                let title_text = self.running_title_text(now_instant);
 
                 let title_line = Line::from(vec![
                     Span::raw(" "),
                     Span::styled(spinner_str, Style::default().fg(crate::colors::info())),
-                    Span::styled(
-                        format!(" {}... ", self.status_message),
-                        Style::default().fg(crate::colors::info()),
-                    ),
+                    Span::styled(format!(" {title_text} "), Style::default().fg(crate::colors::info())),
                 ])
                 .centered();
                 input_block = input_block.title(title_line);
@@ -3076,6 +3128,20 @@ mod tests {
     use crate::app_event::AppEvent;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
+
+    fn render_composer_input_title(composer: &ChatComposer, width: u16) -> String {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: 4,
+        };
+        let mut buf = Buffer::empty(area);
+        composer.render_ref(area, &mut buf);
+        (0..area.width)
+            .map(|x| buf[(area.x + x, area.y)].symbol().to_string())
+            .collect()
+    }
 
     #[test]
     fn auto_review_status_stays_left_with_auto_drive_footer() {
@@ -3273,5 +3339,39 @@ mod tests {
             ChatComposer::map_status_message("waiting for user input"),
             "Working".to_string()
         );
+    }
+
+    #[test]
+    fn running_title_includes_elapsed_time() {
+        let (tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
+        let app_tx = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(true, app_tx, true, false);
+
+        composer.update_status_message("responding".to_string());
+        composer.set_task_running(true);
+        composer.status_started_at = Some(Instant::now() - Duration::from_secs(12));
+
+        let title = render_composer_input_title(&composer, 96);
+
+        assert!(title.contains("Responding"), "{title}");
+        assert!(title.contains("0:12"), "{title}");
+    }
+
+    #[test]
+    fn long_running_title_escalates_without_going_blank() {
+        let (tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
+        let app_tx = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(true, app_tx, true, false);
+
+        composer.update_status_message("running command".to_string());
+        composer.set_task_running(true);
+        composer.status_started_at = Some(Instant::now() - Duration::from_secs(95));
+
+        let title = render_composer_input_title(&composer, 120);
+
+        assert!(title.contains("Still working"), "{title}");
+        assert!(title.contains("Ctrl+C to interrupt"), "{title}");
+        assert!(title.contains("1:35"), "{title}");
+        assert!(!title.trim().is_empty());
     }
 }

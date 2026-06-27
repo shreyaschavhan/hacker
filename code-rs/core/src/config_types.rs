@@ -864,6 +864,77 @@ pub struct Tui {
     pub auto_review_enabled: bool,
 }
 
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct ProbeReviewConfig {
+    /// Run automatic process probes for high-risk AI conclusions.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Trigger mode for v1. "high_risk" runs only on consequential conclusions.
+    #[serde(default = "default_probe_review_mode")]
+    pub mode: String,
+
+    /// Default profile to use when no specific domain profile is detected.
+    #[serde(default = "default_probe_review_profile")]
+    pub default_profile: String,
+
+    /// Run cheap heuristic gating before launching the review agent.
+    #[serde(default = "default_true")]
+    pub cheap_gate: bool,
+
+    /// Minimum risk level that launches the full probe agent.
+    #[serde(default = "default_probe_review_threshold")]
+    pub full_probe_threshold: String,
+
+    /// Inject a post-turn resolution instruction when the probe requires resolution.
+    #[serde(default = "default_true")]
+    pub auto_resolve: bool,
+
+    /// Inherit the active chat model for probe reviews.
+    #[serde(default)]
+    pub use_chat_model: bool,
+
+    /// Optional probe review model. Empty string means use review/auto-review fallback.
+    #[serde(default)]
+    pub model: String,
+
+    /// Reasoning effort for probe review runs.
+    #[serde(default = "default_probe_review_reasoning_effort")]
+    pub model_reasoning_effort: ReasoningEffort,
+}
+
+impl Default for ProbeReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: default_probe_review_mode(),
+            default_profile: default_probe_review_profile(),
+            cheap_gate: true,
+            full_probe_threshold: default_probe_review_threshold(),
+            auto_resolve: true,
+            use_chat_model: false,
+            model: String::new(),
+            model_reasoning_effort: default_probe_review_reasoning_effort(),
+        }
+    }
+}
+
+fn default_probe_review_mode() -> String {
+    "high_risk".to_string()
+}
+
+fn default_probe_review_profile() -> String {
+    "general".to_string()
+}
+
+fn default_probe_review_threshold() -> String {
+    "high".to_string()
+}
+
+fn default_probe_review_reasoning_effort() -> ReasoningEffort {
+    ReasoningEffort::High
+}
+
 // Important: Provide a manual Default so that when no config file exists and we
 // construct `Config` via `unwrap_or_default()`, we still honor the intended
 // default of `alternate_screen = true`. Deriving `Default` would set booleans to

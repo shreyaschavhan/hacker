@@ -23,10 +23,68 @@ use code_protocol::models::ResponseItem;
 use code_protocol::protocol::CompactedItem;
 use code_protocol::protocol::RolloutItem;
 use crate::util::backoff;
+use reqwest::StatusCode;
 use std::time::Duration;
 
 const MAX_REMOTE_COMPACT_CONTEXT_OVERFLOW_TRIMS: usize = 32;
 const MAX_REMOTE_COMPACT_USAGE_LIMIT_RETRIES: usize = 2;
+
+fn prepare_missing_item_retry(
+    err: &CodexErr,
+    turn_items: &mut [ResponseItem],
+    already_retried: bool,
+) -> Option<usize> {
+    if already_retried || !is_missing_compact_item_error(err) {
+        return None;
+    }
+    let stripped = strip_response_item_ids(turn_items);
+    (stripped > 0).then_some(stripped)
+}
+
+fn is_missing_compact_item_error(err: &CodexErr) -> bool {
+    let CodexErr::UnexpectedStatus(resp) = err else {
+        return false;
+    };
+    if resp.status != StatusCode::NOT_FOUND {
+        return false;
+    }
+    let body = resp.body.to_ascii_lowercase();
+    body.contains("previous_response_not_found")
+        || body.contains("item_not_found")
+        || ((body.contains("not found") || body.contains("missing"))
+            && (body.contains("rs_")
+                || body.contains("msg_")
+                || body.contains("fc_")
+                || body.contains("item")))
+}
+
+fn strip_response_item_ids(items: &mut [ResponseItem]) -> usize {
+    let mut stripped = 0usize;
+    for item in items {
+        let id = match item {
+            ResponseItem::AdditionalTools { id, .. }
+            | ResponseItem::Reasoning { id, .. }
+            | ResponseItem::Message { id, .. }
+            | ResponseItem::WebSearchCall { id, .. }
+            | ResponseItem::FunctionCall { id, .. }
+            | ResponseItem::LocalShellCall { id, .. }
+            | ResponseItem::ToolSearchCall { id, .. }
+            | ResponseItem::CustomToolCall { id, .. } => id,
+            ResponseItem::ImageGenerationCall { .. }
+            | ResponseItem::FunctionCallOutput { .. }
+            | ResponseItem::ToolSearchOutput { .. }
+            | ResponseItem::CustomToolCallOutput { .. }
+            | ResponseItem::CompactionSummary { .. }
+            | ResponseItem::ContextCompaction { .. }
+            | ResponseItem::GhostSnapshot { .. }
+            | ResponseItem::Other => continue,
+        };
+        if id.take().is_some() {
+            stripped = stripped.saturating_add(1);
+        }
+    }
+    stripped
+}
 
 pub(super) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
@@ -95,11 +153,13 @@ async fn run_remote_compact_task_inner(
     let max_retries = turn_context.client.get_provider().stream_max_retries();
     let mut retries = 0;
     let mut usage_limit_retries = 0usize;
+    let mut retried_missing_items_without_ids = false;
     let new_history = loop {
         prune_orphan_tool_outputs(&mut turn_items);
 
         let mut prompt = Prompt::default();
         prompt.input = turn_items.clone();
+        prompt.store = !sess.disable_response_storage;
         prompt.base_instructions_override = turn_context.base_instructions.clone();
         prompt.include_additional_instructions = false;
         prompt.log_tag = Some("codex/remote-compact".to_string());
@@ -186,6 +246,26 @@ async fn run_remote_compact_task_inner(
                 continue;
             }
             Err(err) => {
+                if let Some(stripped) = prepare_missing_item_retry(
+                    &err,
+                    &mut turn_items,
+                    retried_missing_items_without_ids,
+                ) {
+                    retried_missing_items_without_ids = true;
+                    retries = 0;
+                    usage_limit_retries = 0;
+                    tracing::warn!(
+                        "remote compact referenced missing response item; stripped {stripped} item id(s) and retrying with inline transcript"
+                    );
+                    sess
+                        .notify_stream_error(
+                            sub_id,
+                            "remote compact referenced missing response items; retrying with inline transcript…"
+                                .to_string(),
+                        )
+                        .await;
+                    continue;
+                }
                 if retries < max_retries {
                     retries += 1;
                     let delay = backoff(retries);
@@ -229,4 +309,69 @@ async fn run_remote_compact_task_inner(
     sess.send_event(event).await;
 
     Ok(new_history)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::UnexpectedResponseError;
+    use code_protocol::models::ContentItem;
+    use reqwest::StatusCode;
+
+    fn missing_item_error() -> CodexErr {
+        CodexErr::UnexpectedStatus(UnexpectedResponseError {
+            status: StatusCode::NOT_FOUND,
+            body: r#"{"error":{"code":"previous_response_not_found","message":"Item rs_123 was not found"}}"#
+                .to_string(),
+            request_id: None,
+        })
+    }
+
+    #[test]
+    fn missing_item_retry_strips_ids_once_and_never_retries_unchanged_payload() {
+        let mut turn_items = vec![
+            ResponseItem::Message {
+                id: Some("msg_123".to_string()),
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "assistant text".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::Reasoning {
+                id: Some("rs_123".to_string()),
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: Some("encrypted".to_string()),
+            },
+            ResponseItem::FunctionCall {
+                id: Some("fc_123".to_string()),
+                name: "shell".to_string(),
+                namespace: None,
+                arguments: "{}".to_string(),
+                call_id: "call_123".to_string(),
+            },
+        ];
+        let before_retry = serde_json::to_string(&turn_items).expect("serialize before retry");
+
+        let stripped =
+            prepare_missing_item_retry(&missing_item_error(), &mut turn_items, false);
+
+        assert_eq!(stripped, Some(3));
+        let after_retry = serde_json::to_string(&turn_items).expect("serialize after retry");
+        assert_ne!(
+            before_retry, after_retry,
+            "missing-item retry must not resend an unchanged invalid payload"
+        );
+        assert!(
+            !after_retry.contains("\"id\""),
+            "missing-item retry should inline items without server ids: {after_retry}"
+        );
+        assert_eq!(
+            prepare_missing_item_retry(&missing_item_error(), &mut turn_items, true),
+            None,
+            "missing-item fallback should be one-shot"
+        );
+    }
 }

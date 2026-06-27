@@ -1000,6 +1000,9 @@ impl AgentManager {
             Some(AgentSourceKind::AutoReview) => {
                 Some(format!("agents/auto-review/{}", agent_id))
             }
+            Some(AgentSourceKind::ProbeReview) => {
+                Some(format!("agents/probe-review/{}", agent_id))
+            }
             _ => None,
         };
 
@@ -1830,6 +1833,7 @@ async fn execute_model_with_permissions(
     if use_current_exe || family == "codex" || family == "code" {
         let subagent = match source_kind {
             Some(AgentSourceKind::AutoReview) => "review",
+            Some(AgentSourceKind::ProbeReview) => "probe",
             _ => "agent",
         };
         env.entry("CODE_OPENAI_SUBAGENT".to_string())

@@ -226,6 +226,11 @@ use crate::exec_command::strip_bash_lc_and_escape;
 #[cfg(feature = "code-fork")]
 use crate::tui_event_extensions::handle_browser_screenshot;
 use crate::chatwidget::message::UserMessage;
+use crate::probe_review::{
+    ProbeProfile, ProbeReviewResult, ProbeTurnState, build_probe_package, build_probe_prompt,
+    detect_probe_trigger, parse_probe_review_result, post_turn_resolution_instruction,
+    probe_notice_lines, risk_meets_threshold,
+};
 use crate::history::compat::{
     ContextBrowserSnapshotRecord,
     ContextDeltaField,
@@ -674,6 +679,29 @@ impl ChatWidget<'_> {
             }
         }
         false
+    }
+
+    fn is_probe_review_agent(agent: &code_core::protocol::AgentInfo) -> bool {
+        if matches!(agent.source_kind, Some(AgentSourceKind::ProbeReview)) {
+            return true;
+        }
+        if let Some(batch) = agent.batch_id.as_deref() {
+            if batch.eq_ignore_ascii_case("probe-review") {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_background_review_agent(agent: &code_core::protocol::AgentInfo) -> bool {
+        Self::is_auto_review_agent(agent) || Self::is_probe_review_agent(agent)
+    }
+
+    fn is_background_review_kind(source_kind: &Option<AgentSourceKind>) -> bool {
+        matches!(
+            source_kind,
+            Some(AgentSourceKind::AutoReview | AgentSourceKind::ProbeReview)
+        )
     }
     fn format_code_bridge_call(&self, args: &JsonValue) -> Option<String> {
         let action = args.get("action")?.as_str()?.to_lowercase();
@@ -1284,6 +1312,12 @@ struct BackgroundReviewState {
 }
 
 #[derive(Clone, Debug)]
+struct ProbeReviewRunState {
+    agent_id: Option<String>,
+    last_seen: std::time::Instant,
+}
+
+#[derive(Clone, Debug)]
 struct PendingAutoReviewRange {
     base: GhostCommit,
     defer_until_turn: Option<u64>,
@@ -1325,6 +1359,7 @@ const AUTO_REVIEW_FALLBACK_MAX: usize = 3;
 const AUTO_REVIEW_FALLBACK_MAX_AGE_SECS: u64 = 12 * 60 * 60; // 12h
 const AUTO_REVIEW_STALE_SECS: u64 = 5 * 60;
 const MAX_PROCESSED_AUTO_REVIEW_AGENTS: usize = 512;
+const MAX_PROCESSED_PROBE_REVIEW_AGENTS: usize = 512;
 const MAX_AGENTS_TERMINAL_ENTRIES: usize = 256;
 const MAX_AGENT_RUNTIME_ENTRIES: usize = 768;
 const MAX_HISTORY_CELLS_HARD_LIMIT: usize = 2400;
@@ -1991,6 +2026,10 @@ pub(crate) struct ChatWidget<'a> {
     processed_auto_review_agents: HashSet<String>,
     processed_auto_review_agent_order: VecDeque<String>,
     auto_review_processed_evicted_total: u64,
+    probe_review_turn: ProbeTurnState,
+    probe_review_run: Option<ProbeReviewRunState>,
+    processed_probe_review_agents: HashSet<String>,
+    processed_probe_review_agent_order: VecDeque<String>,
     // New: coordinator-provided hints for the next Auto turn
     pending_turn_descriptor: Option<TurnDescriptor>,
     pending_auto_turn_config: Option<TurnConfig>,
@@ -2597,7 +2636,10 @@ impl AgentsTerminalState {
             AgentsTerminalTab::Failed => matches!(entry.status, AgentStatus::Failed),
             AgentsTerminalTab::Completed =>
                 matches!(entry.status, AgentStatus::Completed | AgentStatus::Cancelled),
-            AgentsTerminalTab::Review => matches!(entry.source_kind, Some(AgentSourceKind::AutoReview)),
+            AgentsTerminalTab::Review => matches!(
+                entry.source_kind,
+                Some(AgentSourceKind::AutoReview | AgentSourceKind::ProbeReview)
+            ),
         }
     }
 
@@ -4087,7 +4129,7 @@ impl ChatWidget<'_> {
             .iter()
             .any(|a| {
                 matches!(a.status, AgentStatus::Pending | AgentStatus::Running)
-                    && !matches!(a.source_kind, Some(AgentSourceKind::AutoReview))
+                    && !Self::is_background_review_kind(&a.source_kind)
             });
 
         if has_running_non_auto_review {
@@ -4100,7 +4142,7 @@ impl ChatWidget<'_> {
             .iter()
             .any(|a| {
                 matches!(a.status, AgentStatus::Pending | AgentStatus::Running)
-                    && matches!(a.source_kind, Some(AgentSourceKind::AutoReview))
+                    && Self::is_background_review_kind(&a.source_kind)
             });
 
         if has_running_auto_review {
@@ -4120,7 +4162,7 @@ impl ChatWidget<'_> {
 
     fn agent_is_cancelable(agent: &AgentInfo) -> bool {
         matches!(agent.status, AgentStatus::Pending | AgentStatus::Running)
-            && !matches!(agent.source_kind, Some(AgentSourceKind::AutoReview))
+            && !Self::is_background_review_kind(&agent.source_kind)
     }
 
     fn collect_cancelable_agents(&self) -> (Vec<String>, Vec<String>) {
@@ -7086,6 +7128,10 @@ impl ChatWidget<'_> {
             processed_auto_review_agents: HashSet::new(),
             processed_auto_review_agent_order: VecDeque::new(),
             auto_review_processed_evicted_total: 0,
+            probe_review_turn: ProbeTurnState::default(),
+            probe_review_run: None,
+            processed_probe_review_agents: HashSet::new(),
+            processed_probe_review_agent_order: VecDeque::new(),
             pending_turn_descriptor: None,
             render_request_cache: RefCell::new(Vec::new()),
             render_request_cache_dirty: Cell::new(true),
@@ -7476,6 +7522,10 @@ impl ChatWidget<'_> {
             processed_auto_review_agents: HashSet::new(),
             processed_auto_review_agent_order: VecDeque::new(),
             auto_review_processed_evicted_total: 0,
+            probe_review_turn: ProbeTurnState::default(),
+            probe_review_run: None,
+            processed_probe_review_agents: HashSet::new(),
+            processed_probe_review_agent_order: VecDeque::new(),
             pending_turn_descriptor: None,
             render_request_cache: RefCell::new(Vec::new()),
             render_request_cache_dirty: Cell::new(true),
@@ -12340,10 +12390,10 @@ impl ChatWidget<'_> {
             self.bottom_pane
                 .update_status_text("Waiting in background".to_string());
         } else if auto_review_only_active {
-            // Auto Review runs independently; keep input responsive while it continues.
+            // Background reviews run independently; keep input responsive while they continue.
             self.bottom_pane.set_task_running(false);
             self.bottom_pane
-                .update_status_text("Auto Review running in background".to_string());
+                .update_status_text("Review running in background".to_string());
         }
 
         tracing::info!(
@@ -14056,6 +14106,9 @@ impl ChatWidget<'_> {
                 // Track last message for potential dedup heuristics.
                 let cleaned = Self::strip_context_sections(&message);
                 self.last_assistant_message = (!cleaned.trim().is_empty()).then_some(cleaned);
+                if let Some(cleaned) = self.last_assistant_message.as_deref() {
+                    self.probe_review_turn.record_final_answer(cleaned);
+                }
                 // Mark this Answer stream id as closed for the rest of the turn so any late
                 // AgentMessageDelta for the same id is ignored. In the full App runtime,
                 // the InsertFinalAnswer path also marks closed; setting it here makes
@@ -14374,6 +14427,7 @@ impl ChatWidget<'_> {
                 // after every tool call.
                 self.turn_sequence = self.turn_sequence.saturating_add(1);
                 self.turn_had_code_edits = false;
+                self.probe_review_turn.reset_for_turn();
                 self.current_task_lifecycle = self.pending_task_lifecycle.take();
                 self.current_turn_origin = if self.current_task_output_is_hidden() {
                     Some(TurnOrigin::Developer)
@@ -14428,6 +14482,13 @@ impl ChatWidget<'_> {
             EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message }) => {
                 self.clear_reconnecting();
                 self.pending_request_user_input = None;
+                if let Some(message) = last_agent_message
+                    .as_deref()
+                    .map(Self::strip_context_sections)
+                    .filter(|message| !message.trim().is_empty())
+                {
+                    self.probe_review_turn.record_final_answer(&message);
+                }
                 let had_running_execs = !self.exec.running_commands.is_empty();
                 // Finalize any active streams
                 let finalizing_streams = self.stream.is_write_cycle_active();
@@ -14483,6 +14544,7 @@ impl ChatWidget<'_> {
                 // Final re-check for idle state
                 self.maybe_hide_spinner();
                 self.maybe_trigger_auto_review();
+                self.maybe_trigger_probe_review();
                 self.emit_turn_complete_notification(last_agent_message);
                 self.current_task_lifecycle = None;
                 self.suppress_next_agent_hint = false;
@@ -14935,6 +14997,7 @@ impl ChatWidget<'_> {
                 );
             }
             EventMsg::ExecCommandBegin(ev) => {
+                self.probe_review_turn.record_exec_begin(&ev.command);
                 let seq = event.event_seq;
                 let om_begin = event
                     .order
@@ -15017,6 +15080,7 @@ impl ChatWidget<'_> {
                 auto_approved,
                 changes,
             }) => {
+                self.probe_review_turn.record_file_change();
                 let exec_call_id = ExecCallId(call_id.clone());
                 self.exec.suppress_exec_end(exec_call_id);
                 self.diffs.record_patch_set(&changes, true);
@@ -15038,6 +15102,9 @@ impl ChatWidget<'_> {
                 let _ = self.history_insert_with_key_global(Box::new(cell), ok);
             }
             EventMsg::PatchApplyEnd(ev) => {
+                if !ev.success {
+                    self.probe_review_turn.record_exec_end(1);
+                }
                 let ev2 = ev.clone();
                 self.defer_or_handle(
                     move |interrupts| interrupts.push_patch_end(event.event_seq, ev),
@@ -15045,6 +15112,7 @@ impl ChatWidget<'_> {
                 );
             }
             EventMsg::ExecCommandEnd(ev) => {
+                self.probe_review_turn.record_exec_end(ev.exit_code);
                 let ev2 = ev.clone();
                 let seq = event.event_seq;
                 let order_meta_end = event
@@ -15113,6 +15181,7 @@ impl ChatWidget<'_> {
                 tool_name,
                 parameters,
             }) => {
+                self.probe_review_turn.record_custom_tool_begin(&tool_name);
                 self.ensure_spinner_for_activity("tool-begin");
                 // Any custom tool invocation should fade out the welcome animation
                 for cell in &self.history_cells {
@@ -15278,6 +15347,9 @@ impl ChatWidget<'_> {
                 duration,
                 result,
             }) => {
+                if result.is_err() {
+                    self.probe_review_turn.record_exec_end(1);
+                }
                 let params_json = parameters.clone();
                 if agent_runs::is_agent_tool(&tool_name) {
                     if agent_runs::handle_custom_tool_end(
@@ -15754,6 +15826,7 @@ impl ChatWidget<'_> {
             EventMsg::TurnDiff(TurnDiffEvent { unified_diff }) => {
                 info!("TurnDiffEvent: {unified_diff}");
                 self.turn_had_code_edits = true;
+                self.probe_review_turn.record_file_change();
             }
             EventMsg::BackgroundEvent(BackgroundEventEvent { message }) => {
                 info!("BackgroundEvent: {message}");
@@ -15853,10 +15926,16 @@ impl ChatWidget<'_> {
                         last_progress: agent.last_progress.clone(),
                     });
 
-                    let is_auto_review = Self::is_auto_review_agent(agent);
+                    let is_background_review = Self::is_background_review_agent(agent);
+
+                    if !is_background_review
+                        && matches!(parsed_status, AgentStatus::Pending | AgentStatus::Running)
+                    {
+                        self.probe_review_turn.record_agent_event();
+                    }
 
                     if matches!(parsed_status, AgentStatus::Pending | AgentStatus::Running) {
-                        if is_auto_review {
+                        if is_background_review {
                             has_running_auto_review = true;
                         } else {
                             has_running_non_auto_review = true;
@@ -15869,6 +15948,7 @@ impl ChatWidget<'_> {
                 self.update_agents_terminal_state(&agents, context.clone(), task.clone());
 
                 self.observe_auto_review_status(&agents);
+                self.observe_probe_review_status(&agents);
 
                 let agent_hint_label = if has_running_auto_review && !has_running_non_auto_review {
                     AgentHintLabel::Review
@@ -18338,11 +18418,14 @@ impl ChatWidget<'_> {
             entry.last_seen_at = now;
 
             let AgentBatchMetadata { label, prompt: meta_prompt, context: meta_context } = batch_metadata;
-            let auto_review_label = matches!(entry.source_kind, Some(AgentSourceKind::AutoReview))
-                .then(|| "Auto Review".to_string());
+            let review_label = match entry.source_kind {
+                Some(AgentSourceKind::AutoReview) => Some("Auto Review".to_string()),
+                Some(AgentSourceKind::ProbeReview) => Some("Probe Review".to_string()),
+                _ => None,
+            };
             let previous_label = entry.batch_label.clone();
             entry.batch_label = label
-                .or(auto_review_label)
+                .or(review_label)
                 .or_else(|| info.batch_id.clone())
                 .or(previous_label);
 
@@ -19046,12 +19129,13 @@ fi\n\
             return true;
         }
         if self.active_agents.iter().any(|agent| {
-            let is_auto_review = matches!(agent.source_kind, Some(AgentSourceKind::AutoReview))
-                || agent
-                    .batch_id
-                    .as_deref()
-                    .is_some_and(|batch| batch.eq_ignore_ascii_case("auto-review"));
-            matches!(agent.status, AgentStatus::Pending | AgentStatus::Running) && !is_auto_review
+            let is_background_review = Self::is_background_review_kind(&agent.source_kind)
+                || agent.batch_id.as_deref().is_some_and(|batch| {
+                    batch.eq_ignore_ascii_case("auto-review")
+                        || batch.eq_ignore_ascii_case("probe-review")
+                });
+            matches!(agent.status, AgentStatus::Pending | AgentStatus::Running)
+                && !is_background_review
         }) {
             return true;
         }
@@ -26347,7 +26431,7 @@ Have we met every part of this goal and is there no further work to do?"#
             && self.active_task_ids.is_empty()
     }
 
-    /// True when the only active work is background Auto Review agents.
+    /// True when the only active work is background review agents.
     ///
     /// In this mode, user input should continue immediately instead of taking
     /// the `QueueUserInput` path, because queueing behind review-only work can
@@ -26355,19 +26439,19 @@ Have we met every part of this goal and is there no further work to do?"#
     fn auto_review_only_activity(&self) -> bool {
         let has_running_auto_review = self.active_agents.iter().any(|agent| {
             matches!(agent.status, AgentStatus::Pending | AgentStatus::Running)
-                && matches!(agent.source_kind, Some(AgentSourceKind::AutoReview))
+                && Self::is_background_review_kind(&agent.source_kind)
         });
 
         let has_running_non_auto_review = self.active_agents.iter().any(|agent| {
             matches!(agent.status, AgentStatus::Pending | AgentStatus::Running)
-                && !matches!(agent.source_kind, Some(AgentSourceKind::AutoReview))
+                && !Self::is_background_review_kind(&agent.source_kind)
         });
 
         if has_running_non_auto_review {
             return false;
         }
 
-        if !(has_running_auto_review || self.background_review.is_some()) {
+        if !(has_running_auto_review || self.background_review.is_some() || self.probe_review_run.is_some()) {
             return false;
         }
 
@@ -30910,6 +30994,85 @@ async fn run_background_review(
             snapshot: None,
         });
     }
+}
+
+async fn run_probe_review(config: Config, prompt: String) {
+    {
+        let mgr = code_core::AGENT_MANAGER.read().await;
+        let busy = mgr
+            .list_agents(None, Some("probe-review".to_string()), false)
+            .into_iter()
+            .any(|agent| {
+                let status = format!("{:?}", agent.status).to_ascii_lowercase();
+                status == "running" || status == "pending"
+            });
+        if busy {
+            return;
+        }
+    }
+
+    fn ensure_code_prefix(model: &str) -> String {
+        let lower = model.to_ascii_lowercase();
+        if lower.starts_with("code-") {
+            model.to_string()
+        } else {
+            format!("code-{}", model)
+        }
+    }
+
+    let configured_model = if config.probe_review.use_chat_model {
+        config.model.trim()
+    } else if !config.probe_review.model.trim().is_empty() {
+        config.probe_review.model.trim()
+    } else if !config.auto_review_model.trim().is_empty() {
+        config.auto_review_model.trim()
+    } else if !config.review_model.trim().is_empty() {
+        config.review_model.trim()
+    } else {
+        config.model.trim()
+    };
+    if configured_model.is_empty() {
+        return;
+    }
+
+    let probe_model = ensure_code_prefix(configured_model);
+    let reasoning_effort = if config.probe_review.use_chat_model {
+        config.model_reasoning_effort
+    } else {
+        config.probe_review.model_reasoning_effort
+    };
+
+    let agent_config = AgentConfig {
+        name: probe_model.clone(),
+        command: String::new(),
+        args: Vec::new(),
+        read_only: true,
+        enabled: true,
+        description: Some("ProcessProbe review agent".to_string()),
+        env: None,
+        args_read_only: None,
+        args_write: None,
+        instructions: None,
+    };
+
+    let mut manager = code_core::AGENT_MANAGER.write().await;
+    manager
+        .create_agent_with_options(
+            probe_model,
+            Some("Probe Review".to_string()),
+            prompt,
+            None,
+            Some("Return only the ProcessProbe JSON result.".to_string()),
+            Vec::new(),
+            true,
+            Some("probe-review".to_string()),
+            Some(agent_config),
+            None,
+            None,
+            Some(code_core::protocol::AgentSourceKind::ProbeReview),
+            reasoning_effort.into(),
+        )
+        .await;
 }
 
 #[allow(dead_code)]
@@ -35934,6 +36097,54 @@ use code_core::protocol::OrderMeta;
     }
 
     #[test]
+    fn running_exec_title_shows_tool_state_and_elapsed_time() {
+        let _rt = enter_test_runtime_guard();
+        let mut harness = ChatWidgetHarness::new();
+        {
+            let chat = harness.chat();
+            reset_history(chat);
+        }
+
+        let turn_id = "turn-1".to_string();
+        harness.handle_event(Event {
+            id: turn_id.clone(),
+            event_seq: 0,
+            msg: EventMsg::TaskStarted,
+            order: None,
+        });
+
+        harness.handle_event(Event {
+            id: "exec-1".to_string(),
+            event_seq: 1,
+            msg: EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                call_id: "exec-1".to_string(),
+                command: vec!["bash".into(), "-lc".into(), "sleep 30".into()],
+                cwd: std::env::temp_dir(),
+                parsed_cmd: vec![ParsedCommand::Unknown {
+                    cmd: "sleep 30".to_string(),
+                }],
+            }),
+            order: Some(OrderMeta {
+                request_ordinal: 1,
+                output_index: Some(0),
+                sequence_number: Some(0),
+            }),
+        });
+
+        harness.flush_into_widget();
+
+        let frame = crate::test_helpers::render_chat_widget_to_vt100(&mut harness, 96, 24);
+        assert!(
+            frame.contains("Using tools"),
+            "running exec should show tool-use status:\n{frame}"
+        );
+        assert!(
+            frame.contains("0:00"),
+            "running exec should include elapsed time:\n{frame}"
+        );
+    }
+
+    #[test]
     fn mid_turn_answer_stays_unfinalized_while_turn_is_active() {
         let _rt = enter_test_runtime_guard();
         let mut harness = ChatWidgetHarness::new();
@@ -37401,6 +37612,73 @@ impl ChatWidget<'_> {
         }
     }
 
+    fn maybe_trigger_probe_review(&mut self) {
+        if !self.config.probe_review.enabled {
+            return;
+        }
+        if self.current_task_should_skip_auto_review() {
+            return;
+        }
+
+        if let Some(run) = self.probe_review_run.as_ref() {
+            if run.last_seen.elapsed().as_secs() < AUTO_REVIEW_STALE_SECS {
+                return;
+            }
+            self.probe_review_run = None;
+        }
+
+        let Some(mut trigger) = detect_probe_trigger(&self.probe_review_turn) else {
+            return;
+        };
+
+        let mode = self.config.probe_review.mode.trim().to_ascii_lowercase();
+        if matches!(mode.as_str(), "off" | "disabled") {
+            return;
+        }
+        if mode == "manual" && !trigger.force {
+            return;
+        }
+        if self.config.probe_review.cheap_gate
+            && !trigger.force
+            && mode != "always"
+            && !risk_meets_threshold(trigger.risk_level, &self.config.probe_review.full_probe_threshold)
+        {
+            return;
+        }
+
+        if matches!(trigger.profile, ProbeProfile::General) {
+            trigger.profile = match self
+                .config
+                .probe_review
+                .default_profile
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "security" => ProbeProfile::Security,
+                "debugging" => ProbeProfile::Debugging,
+                _ => ProbeProfile::General,
+            };
+        }
+
+        let package = build_probe_package(&self.probe_review_turn, &trigger);
+        let prompt = build_probe_prompt(&package);
+        self.launch_probe_review(prompt);
+    }
+
+    fn launch_probe_review(&mut self, prompt: String) {
+        self.probe_review_run = Some(ProbeReviewRunState {
+            agent_id: None,
+            last_seen: std::time::Instant::now(),
+        });
+        self.push_background_tail("Probe Review: reviewing high-risk process conclusion.");
+
+        let config = self.config.clone();
+        tokio::spawn(async move {
+            run_probe_review(config, prompt).await;
+        });
+    }
+
     fn auto_review_has_changes_since(&self, reviewed: &GhostCommit) -> bool {
         let reviewed_id = reviewed.id();
         let tracked_changes = match self.run_git_command(
@@ -37682,6 +37960,100 @@ impl ChatWidget<'_> {
                 Some(agent.id.clone()),
                 snapshot,
             );
+        }
+    }
+
+    fn observe_probe_review_status(&mut self, agents: &[code_core::protocol::AgentInfo]) {
+        let now = Instant::now();
+        for agent in agents {
+            if !Self::is_probe_review_agent(agent) {
+                continue;
+            }
+
+            if let Some(state) = self.probe_review_run.as_mut() {
+                state.last_seen = now;
+                if state.agent_id.is_none() {
+                    state.agent_id = Some(agent.id.clone());
+                }
+            }
+
+            let status = agent_status_from_str(agent.status.as_str());
+            if matches!(status, AgentStatus::Pending | AgentStatus::Running) {
+                continue;
+            }
+            if !matches!(
+                status,
+                AgentStatus::Completed | AgentStatus::Failed | AgentStatus::Cancelled
+            ) {
+                continue;
+            }
+            if self.processed_probe_review_agents.contains(&agent.id) {
+                continue;
+            }
+
+            self.remember_processed_probe_review_agent(&agent.id);
+            self.probe_review_run = None;
+
+            if let Some(error) = agent.error.as_deref().map(str::trim).filter(|err| !err.is_empty()) {
+                self.history_push_plain_paragraphs(
+                    PlainMessageKind::Notice,
+                    vec![
+                        "Probe Review: failed before producing a result.".to_string(),
+                        Self::truncate_with_ellipsis(error, MAX_AUTO_REVIEW_ERROR_SUMMARY_CHARS),
+                    ],
+                );
+                continue;
+            }
+
+            let Some(raw_result) = agent.result.as_deref() else {
+                self.history_push_plain_paragraphs(
+                    PlainMessageKind::Notice,
+                    ["Probe Review: finished without a result."],
+                );
+                continue;
+            };
+
+            match parse_probe_review_result(raw_result) {
+                Ok(result) => self.handle_probe_review_result(result),
+                Err(err) => {
+                    self.history_push_plain_paragraphs(
+                        PlainMessageKind::Notice,
+                        vec![
+                            "Probe Review: result could not be parsed.".to_string(),
+                            Self::truncate_with_ellipsis(&err, MAX_AUTO_REVIEW_ERROR_SUMMARY_CHARS),
+                        ],
+                    );
+                }
+            }
+        }
+    }
+
+    fn handle_probe_review_result(&mut self, result: ProbeReviewResult) {
+        let lines = probe_notice_lines(&result);
+        self.history_push_plain_paragraphs(PlainMessageKind::Notice, lines);
+
+        if !self.config.probe_review.auto_resolve {
+            return;
+        }
+
+        let Some(instruction) = post_turn_resolution_instruction(&result) else {
+            return;
+        };
+        let bounded_note =
+            Self::truncate_with_ellipsis(instruction.trim(), MAX_PENDING_AUTO_REVIEW_NOTE_CHARS);
+        if bounded_note.trim().is_empty() {
+            return;
+        }
+
+        self.last_developer_message = Some(Self::truncate_with_ellipsis(
+            &bounded_note,
+            MAX_AUTO_REVIEW_NOTE_CONTEXT_CHARS,
+        ));
+        if let Err(err) = self
+            .code_op_tx
+            .send(Op::AddPostTurnDeveloperInput { text: bounded_note })
+        {
+            tracing::error!("failed to send probe review AddPostTurnDeveloperInput op: {err}");
         }
     }
 
@@ -38162,6 +38534,26 @@ impl ChatWidget<'_> {
                 total_evicted = self.auto_review_processed_evicted_total,
                 "trimmed processed auto-review agent cache"
             );
+        }
+    }
+
+    fn remember_processed_probe_review_agent(&mut self, agent_id: &str) {
+        if agent_id.trim().is_empty() {
+            return;
+        }
+
+        if !self.processed_probe_review_agents.insert(agent_id.to_string()) {
+            return;
+        }
+
+        self.processed_probe_review_agent_order
+            .push_back(agent_id.to_string());
+
+        while self.processed_probe_review_agents.len() > MAX_PROCESSED_PROBE_REVIEW_AGENTS {
+            let Some(oldest) = self.processed_probe_review_agent_order.pop_front() else {
+                break;
+            };
+            self.processed_probe_review_agents.remove(&oldest);
         }
     }
 

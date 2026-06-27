@@ -20,6 +20,7 @@ use crate::config_types::Notifications;
 use crate::config_types::OtelConfig;
 use crate::config_types::OtelConfigToml;
 use crate::config_types::OtelExporterKind;
+use crate::config_types::ProbeReviewConfig;
 use crate::config_types::default_auto_drive_model_routing_entries;
 use crate::config_types::ProjectCommandConfig;
 use crate::config_types::ProjectHookConfig;
@@ -255,6 +256,9 @@ pub struct Config {
 
     /// Whether Auto Review should inherit the chat model instead of a dedicated override.
     pub auto_review_use_chat_model: bool,
+
+    /// Process-level probe review configuration.
+    pub probe_review: ProbeReviewConfig,
 
     /// Model used to apply fixes during Auto Review follow-ups.
     pub auto_review_resolve_model: String,
@@ -655,6 +659,10 @@ pub struct ConfigToml {
     /// Inherit chat model for Auto Review when true.
     #[serde(default)]
     pub auto_review_use_chat_model: bool,
+
+    /// Process-level probe review settings.
+    #[serde(default)]
+    pub probe_review: ProbeReviewConfig,
 
     /// Resolve model override used during Auto Review follow-ups.
     pub auto_review_resolve_model: Option<String>,
@@ -1622,6 +1630,7 @@ impl Config {
             auto_review_model,
             auto_review_model_reasoning_effort,
             auto_review_use_chat_model,
+            probe_review: cfg.probe_review.clone(),
             auto_review_resolve_model,
             auto_review_resolve_model_reasoning_effort,
             auto_review_resolve_use_chat_model,
@@ -2750,6 +2759,51 @@ model_verbosity = "high"
         assert!(parsed.review_use_chat_model);
         assert_eq!(parsed.review_model.as_deref(), Some("custom-review"));
         assert_eq!(parsed.review_model_reasoning_effort, Some(ReasoningEffort::High));
+        Ok(())
+    }
+
+    #[test]
+    fn probe_review_config_parses_defaults_and_overrides() -> anyhow::Result<()> {
+        let defaults: ConfigToml = toml::from_str("")?;
+        assert!(defaults.probe_review.enabled);
+        assert_eq!(defaults.probe_review.mode, "high_risk");
+        assert_eq!(defaults.probe_review.default_profile, "general");
+        assert!(defaults.probe_review.cheap_gate);
+        assert_eq!(defaults.probe_review.full_probe_threshold, "high");
+        assert!(defaults.probe_review.auto_resolve);
+        assert_eq!(defaults.probe_review.model, "");
+        assert_eq!(
+            defaults.probe_review.model_reasoning_effort,
+            ReasoningEffort::High
+        );
+
+        let parsed: ConfigToml = toml::from_str(
+            r#"
+            [probe_review]
+            enabled = false
+            mode = "manual"
+            default_profile = "security"
+            cheap_gate = false
+            full_probe_threshold = "medium"
+            auto_resolve = false
+            use_chat_model = true
+            model = "gpt-5.5"
+            model_reasoning_effort = "xhigh"
+            "#,
+        )?;
+
+        assert!(!parsed.probe_review.enabled);
+        assert_eq!(parsed.probe_review.mode, "manual");
+        assert_eq!(parsed.probe_review.default_profile, "security");
+        assert!(!parsed.probe_review.cheap_gate);
+        assert_eq!(parsed.probe_review.full_probe_threshold, "medium");
+        assert!(!parsed.probe_review.auto_resolve);
+        assert!(parsed.probe_review.use_chat_model);
+        assert_eq!(parsed.probe_review.model, "gpt-5.5");
+        assert_eq!(
+            parsed.probe_review.model_reasoning_effort,
+            ReasoningEffort::XHigh
+        );
         Ok(())
     }
 

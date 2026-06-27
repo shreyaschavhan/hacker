@@ -85,6 +85,18 @@ approval_policy = "on-request"
 # - danger-full-access (no sandbox; extremely risky)
 sandbox_mode = "read-only"
 
+# ProcessProbe reviews high-risk AI conclusions/process. It is not limited to code diffs.
+[probe_review]
+enabled = true
+mode = "high_risk"
+default_profile = "general"
+cheap_gate = true
+full_probe_threshold = "high"
+auto_resolve = true
+use_chat_model = false
+model = ""
+model_reasoning_effort = "high"
+
 # Extra settings used only when sandbox_mode = "workspace-write".
 [sandbox_workspace_write]
 # Additional writable roots beyond the workspace (cwd). Default: []
