@@ -2961,6 +2961,7 @@ impl WidgetRef for ChatComposer {
         }
 
         if self.is_task_running && !self.embedded_mode {
+            let mut title_rendered = false;
             if self.auto_drive_active {
                 if let Some(style) = self.auto_drive_style.as_ref() {
                     if self
@@ -2974,9 +2975,12 @@ impl WidgetRef for ChatComposer {
                         let title_line =
                             Line::from(Span::styled(title_text, style.title_style.clone()));
                         input_block = input_block.title(title_line);
+                        title_rendered = true;
                     }
                 }
-            } else {
+            }
+
+            if !title_rendered {
                 use std::time::{Instant, SystemTime, UNIX_EPOCH};
                 let now_instant = Instant::now();
                 let now_ms = SystemTime::now()
@@ -3355,6 +3359,24 @@ mod tests {
 
         assert!(title.contains("Responding"), "{title}");
         assert!(title.contains("0:12"), "{title}");
+    }
+
+    #[test]
+    fn auto_drive_running_title_does_not_go_blank() {
+        let (tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
+        let app_tx = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(true, app_tx, true, false);
+
+        composer.auto_drive_active = true;
+        composer.update_status_message("running command".to_string());
+        composer.set_task_running(true);
+        composer.status_started_at = Some(Instant::now() - Duration::from_secs(18));
+
+        let title = render_composer_input_title(&composer, 120);
+
+        assert!(title.contains("Using tools"), "{title}");
+        assert!(title.contains("0:18"), "{title}");
+        assert!(!title.trim().is_empty());
     }
 
     #[test]
