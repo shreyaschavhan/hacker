@@ -23,6 +23,7 @@ Personal fork additions:
 - **Not security-only** - ProcessProbe has general, security, and debugging profiles, so it can review unsupported confidence in ordinary coding, research, debugging, and report-writing tasks too.
 - **Cheap trigger gate first** - the probe is not run on every turn. It uses the final answer plus process signals such as tool failures, validation signals, file changes, and agent events before escalating to a full review.
 - **Post-turn correction loop** - when ProcessProbe says resolution is required, the TUI injects a follow-up developer instruction so the main assistant must resolve or downgrade the prior conclusion before treating it as stable.
+- **Epistemic status tagging** - normal assistant responses tag substantive claims as `[OBSERVED]`, `[MEMORY]`, `[INFERRED - <confidence>, uncertainty: <reason>]`, or `[ASSUMED]` so direct evidence is separated from recall, reasoning, and working premises.
 - **Working-state visibility** - the responding/thinking/tool-use status now includes elapsed time and escalates to "Still working" messaging on long runs.
 - **Compact checkpoint prompt** - the default compaction prompt now asks for a concise, factual handoff with decisions, constraints, next steps, blockers, and validation needs.
 

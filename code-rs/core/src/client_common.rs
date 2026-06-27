@@ -812,6 +812,45 @@ mod tests {
     }
 
     #[test]
+    fn default_developer_prompt_includes_epistemic_status_policy() {
+        let prompt = Prompt::default();
+        let formatted = prompt.get_formatted_input();
+        let first = formatted.first().expect("developer prompt item");
+        let text = match first {
+            ResponseItem::Message { role, content, .. } => {
+                assert_eq!(role, "developer");
+                match content.first() {
+                    Some(ContentItem::InputText { text }) => text,
+                    other => panic!("unexpected developer content: {other:?}"),
+                }
+            }
+            other => panic!("unexpected first item: {other:?}"),
+        };
+
+        assert!(text.contains("Epistemic Status Tagging"));
+        assert!(text.contains("[OBSERVED]"));
+        assert!(text.contains("[MEMORY]"));
+        assert!(text.contains("[INFERRED - High confidence"));
+        assert!(text.contains("[ASSUMED]"));
+        assert!(!text.contains("[UNKNOWN]"));
+    }
+
+    #[test]
+    fn helper_prompts_can_disable_epistemic_status_policy() {
+        let prompt = Prompt {
+            include_additional_instructions: false,
+            ..Default::default()
+        };
+
+        let formatted = prompt.get_formatted_input();
+        let combined = format!("{formatted:?}");
+
+        assert!(!combined.contains("Epistemic Status Tagging"));
+        assert!(!combined.contains("[OBSERVED]"));
+        assert!(!combined.contains("[UNKNOWN]"));
+    }
+
+    #[test]
     fn serializes_text_verbosity_when_set() {
         let input: Vec<ResponseItem> = vec![];
         let tools: Vec<serde_json::Value> = vec![];
