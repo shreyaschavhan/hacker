@@ -1,5 +1,6 @@
 ---
 source: tui/tests/bottom_spacer_clip_regression.rs
+assertion_line: 49
 expression: collapsed
 ---
  ★   /code - perform a coding task (multiple agents)
@@ -20,6 +21,8 @@ expression: collapsed
 
    Having reasoned through the constraints, the assistant now presents a final answer summarising why the spacer
  • preserves the last visible line.
+
+  • Working (0s • esc to interrupt)
 
  | What can I code for you today?                                                                                     |
 

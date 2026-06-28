@@ -986,8 +986,13 @@ mod tests {
         let lines = build_compact_lines(&info);
         assert!(lines.len() >= 3, "expected section header + two rows");
         let tokens_line = plain_text(&lines[1]);
+        let expected_usage = format!(
+            "{} / {}",
+            format_with_separators_u64(42_972),
+            format_with_separators_u64(350_000)
+        );
         assert!(
-            tokens_line.contains("42,972 / 350,000"),
+            tokens_line.contains(&expected_usage),
             "compact tokens line should show context usage: {tokens_line}"
         );
     }

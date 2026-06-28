@@ -5,6 +5,7 @@ use crate::app_event_sender::AppEventSender;
 use crate::auto_drive_style::AutoDriveVariant;
 use crate::bottom_pane::chat_composer::ComposerRenderMode;
 use crate::chatwidget::BackgroundOrderTicket;
+use crate::status_indicator_widget::StatusIndicatorWidget;
 use crate::user_approval_widget::{ApprovalRequest, UserApprovalWidget};
 use crate::thread_spawner;
 pub(crate) use bottom_pane_view::BottomPaneView;
@@ -124,6 +125,60 @@ enum ActiveViewKind {
     Other,
 }
 
+struct StatusIndicatorView {
+    indicator: StatusIndicatorWidget,
+}
+
+impl StatusIndicatorView {
+    fn new(app_event_tx: AppEventSender) -> Self {
+        Self {
+            indicator: StatusIndicatorWidget::new(app_event_tx),
+        }
+    }
+}
+
+impl<'a> BottomPaneView<'a> for StatusIndicatorView {
+    fn desired_height(&self, width: u16) -> u16 {
+        self.indicator.desired_height(width)
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.indicator.render_ref(area, buf);
+    }
+
+    fn render_with_composer(&self, area: Rect, buf: &mut Buffer, composer: &ChatComposer) {
+        let status_height = self.indicator.desired_height(area.width).min(area.height);
+        if status_height > 0 {
+            let status_area = Rect {
+                height: status_height,
+                ..area
+            };
+            self.indicator.render_ref(status_area, buf);
+        }
+
+        let composer_height = area.height.saturating_sub(status_height);
+        if composer_height > 0 {
+            let composer_area = Rect {
+                y: area.y.saturating_add(status_height),
+                height: composer_height,
+                ..area
+            };
+            let bg = ratatui::style::Style::default().bg(crate::colors::background());
+            fill_rect(buf, composer_area, None, bg);
+            composer.render_ref(composer_area, buf);
+        }
+    }
+
+    fn update_status_text(&mut self, _text: String) -> ConditionalUpdate {
+        self.indicator.update_header("Working".to_string());
+        ConditionalUpdate::NeedsRedraw
+    }
+
+    fn should_hide_when_task_is_done(&mut self) -> bool {
+        true
+    }
+}
+
 /// Pane displayed in the lower half of the chat UI.
 pub(crate) struct BottomPane<'a> {
     /// Composer is retained even when a BottomPaneView is displayed so the
@@ -217,6 +272,34 @@ impl BottomPane<'_> {
             .and_then(|view| view.as_any())
             .and_then(|any| any.downcast_ref::<AutoCoordinatorView>())
             .map(|view| view.model().clone())
+    }
+
+    fn status_view_height(&self, width: u16) -> u16 {
+        if !self.status_view_active {
+            return 0;
+        }
+
+        self.active_view
+            .as_ref()
+            .map(|view| view.desired_height(width))
+            .unwrap_or(0)
+    }
+
+    fn show_status_view_if_available(&mut self) {
+        if self.active_view_kind == ActiveViewKind::AutoCoordinator {
+            return;
+        }
+        if self.active_view.is_some() && !self.status_view_active {
+            return;
+        }
+
+        let mut view = StatusIndicatorView::new(self.app_event_tx.clone());
+        if let Some(status) = self.composer.status_message() {
+            let _ = view.update_status_text(status.to_string());
+        }
+        self.active_view = Some(Box::new(view));
+        self.active_view_kind = ActiveViewKind::Other;
+        self.status_view_active = true;
     }
 
     fn apply_auto_drive_style(&mut self) {
@@ -329,10 +412,12 @@ impl BottomPane<'_> {
                 } else {
                     self.composer.footer_height()
                 }
+            } else if self.status_view_active {
+                self.composer.desired_height(width)
             } else {
                 0
             };
-            let pad = if is_auto {
+            let pad = if is_auto || self.status_view_active {
                 BottomPane::BOTTOM_PAD_LINES
             } else {
                 0
@@ -355,14 +440,16 @@ impl BottomPane<'_> {
     pub fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
         // Hide the cursor whenever an overlay view is active (e.g. approval modal).
         // But keep cursor visible when only status overlay is shown.
-        if self.active_view.is_some() {
+        if self.active_view.is_some() && !self.status_view_active {
             None
         } else {
             // Account for the optional empty line above the composer
-            let y_offset = if self.top_spacer_enabled { 1u16 } else { 0u16 };
+            let horizontal_padding = 1u16; // Message input uses 1 char padding
+            let content_width = area.width.saturating_sub(horizontal_padding * 2);
+            let mut y_offset = if self.top_spacer_enabled { 1u16 } else { 0u16 };
+            y_offset = y_offset.saturating_add(self.status_view_height(content_width));
 
             // Adjust composer area to account for empty line and padding
-            let horizontal_padding = 1u16; // Message input uses 1 char padding
             let composer_rect = Rect {
                 x: area.x + horizontal_padding,
                 y: area.y + y_offset,
@@ -378,6 +465,10 @@ impl BottomPane<'_> {
 
     /// Forward a key event to the active view or the composer.
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> InputResult {
+        if self.status_view_active {
+            return self.handle_composer_key_event(key_event);
+        }
+
         if let Some(mut view) = self.active_view.take() {
             let kind = self.active_view_kind;
             if matches!(kind, ActiveViewKind::AutoCoordinator) {
@@ -421,8 +512,10 @@ impl BottomPane<'_> {
             } else {
                 self.active_view_kind = ActiveViewKind::None;
                 self.set_standard_terminal_hint(None);
+                if self.is_task_running {
+                    self.show_status_view_if_available();
+                }
             }
-            // Don't create a status view - keep composer visible
             // Debounce view navigation redraws to reduce render thrash
             self.request_redraw();
 
@@ -496,6 +589,14 @@ impl BottomPane<'_> {
     }
 
     pub fn handle_paste(&mut self, pasted: String) {
+        if self.status_view_active {
+            let needs_redraw = self.composer.handle_paste(pasted);
+            if needs_redraw {
+                self.request_redraw();
+            }
+            return;
+        }
+
         if let Some(mut view) = self.active_view.take() {
             use crate::bottom_pane::bottom_pane_view::ConditionalUpdate;
             let kind = self.active_view_kind;
@@ -506,6 +607,9 @@ impl BottomPane<'_> {
             } else {
                 self.active_view_kind = ActiveViewKind::None;
                 self.set_standard_terminal_hint(None);
+                if self.is_task_running {
+                    self.show_status_view_if_available();
+                }
             }
             if matches!(update, ConditionalUpdate::NeedsRedraw) {
                 self.request_redraw();
@@ -551,6 +655,7 @@ impl BottomPane<'_> {
         // Consider a modal inactive once it has completed to avoid blocking
         // Esc routing and other overlay checks after a decision is made.
         match self.active_view.as_ref() {
+            Some(_) if self.status_view_active => false,
             Some(_) if matches!(self.active_view_kind, ActiveViewKind::AutoCoordinator) => false,
             Some(view) => !view.is_complete(),
             None => false,
@@ -663,10 +768,9 @@ impl BottomPane<'_> {
         self.composer.set_task_running(running);
 
         if running {
-            // No longer need separate status widget - title shows in composer
+            self.show_status_view_if_available();
             self.request_redraw();
         } else {
-            // Status now shown in composer title
             // Drop the status view when a task completes, but keep other
             // modal views (e.g. approval dialogs).
             if let Some(mut view) = self.active_view.take() {
@@ -940,7 +1044,10 @@ impl BottomPane<'_> {
             }
         }
 
-        if self.active_view.is_some() && self.active_view_kind != ActiveViewKind::AutoCoordinator {
+        if self.active_view.is_some()
+            && !self.status_view_active
+            && self.active_view_kind != ActiveViewKind::AutoCoordinator
+        {
             self.composer.set_render_mode(ComposerRenderMode::Full);
             return;
         }

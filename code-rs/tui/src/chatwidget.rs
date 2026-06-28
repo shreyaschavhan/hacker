@@ -35884,8 +35884,9 @@ use code_core::protocol::OrderMeta;
 
         let frame = crate::test_helpers::render_chat_widget_to_vt100(&mut harness, 96, 24);
         assert!(
-            frame.contains("Thinking") && frame.contains("0:00"),
-            "prompt submission should show a live elapsed timer before backend events:\n{frame}"
+            frame.contains("Working (")
+                && frame.contains("s • esc to interrupt"),
+            "prompt submission should show the live working-time row before backend events:\n{frame}"
         );
     }
 

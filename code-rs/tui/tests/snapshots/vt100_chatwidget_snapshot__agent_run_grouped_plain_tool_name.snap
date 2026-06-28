@@ -1,12 +1,11 @@
 ---
 source: tui/tests/vt100_chatwidget_snapshot.rs
+assertion_line: 2115
 expression: output
 ---
  +----------------------------------------------------------------------------+
  |                                 Every Code                                 |
  +----------------------------------------------------------------------------+
-
-
 
  • I can help with various tasks including:
 
@@ -29,7 +28,9 @@ expression: output
    |
    +- [Ctrl+A] Expand · [Esc] Stop
 
- +----------------------------- ✶ Responding... -----------------------------+
+  • Working (Xs • esc to interrupt)
+
+ +----------------------------- ✶ Responding... MM:SS -----------------------------+
  | What can I code for you today?                                             |
  +----------------------------------------------------------------------------+
  Read Only  (Shift+Tab change)                       Ctrl+G editor  •  API key

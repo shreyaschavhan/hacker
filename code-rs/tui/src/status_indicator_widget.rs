@@ -151,11 +151,9 @@ impl WidgetRef for StatusIndicatorWidget {
             ratatui::text::Span::raw(" "),
         ];
         spans.extend(vec![
-            ratatui::text::Span::raw(" "),
-            // (12s • Esc to interrupt)
             ratatui::text::Span::raw(format!("({elapsed}s • ")).style(Style::default().fg(text_dim)),
-            ratatui::text::Span::raw("Esc").style(Style::default().fg(accent).add_modifier(ratatui::style::Modifier::BOLD)),
-            ratatui::text::Span::raw(")").style(Style::default().fg(text_dim)),
+            ratatui::text::Span::raw("esc").style(Style::default().fg(accent).add_modifier(ratatui::style::Modifier::BOLD)),
+            ratatui::text::Span::raw(" to interrupt)").style(Style::default().fg(text_dim)),
         ]);
 
         // Build lines: status, then queued messages, then spacer.
@@ -197,4 +195,3 @@ impl WidgetRef for StatusIndicatorWidget {
         paragraph.render_ref(area, buf);
     }
 }
-
