@@ -904,6 +904,8 @@ pub struct ImageRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExploreRecord {
     pub id: HistoryId,
+    #[serde(default = "SystemTime::now")]
+    pub started_at: SystemTime,
     pub entries: Vec<ExploreEntry>,
 }
 
@@ -3109,6 +3111,7 @@ mod tests {
 
         records.push(HistoryRecord::Explore(ExploreRecord {
             id: HistoryId(14),
+            started_at: SystemTime::UNIX_EPOCH,
             entries: vec![ExploreEntry {
                 action: ExecAction::Read,
                 summary: ExploreSummary::Read {

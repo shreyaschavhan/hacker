@@ -11,6 +11,7 @@ use code_core::protocol::{Event, EventMsg, ReplayHistoryEvent};
 use code_protocol::models::{ContentItem, ResponseItem};
 use code_tui::test_helpers::{render_chat_widget_to_vt100, ChatWidgetHarness};
 use serde_json::to_value;
+use std::time::{Duration, SystemTime};
 
 fn assistant_cell_count(screen: &str) -> usize {
     screen
@@ -83,6 +84,9 @@ fn plan_update_state(id: u64, description: &str) -> HistoryRecord {
 fn explore_record(id: u64) -> HistoryRecord {
     HistoryRecord::Explore(ExploreRecord {
         id: HistoryId(id),
+        started_at: SystemTime::now()
+            .checked_sub(Duration::from_secs(12))
+            .unwrap_or(SystemTime::UNIX_EPOCH),
         entries: vec![ExploreEntry {
             action: code_core::history::ExecAction::List,
             summary: ExploreSummary::Command {
@@ -213,7 +217,8 @@ fn replay_history_hides_interleaved_reasoning_after_exploring() {
 
     let screen = render_chat_widget_to_vt100(&mut harness, 80, 24);
 
-    assert!(screen.contains("Exploring..."), "screen: {screen}");
+    assert!(screen.contains("Exploring"), "screen: {screen}");
+    assert!(screen.contains("working for"), "screen: {screen}");
     assert!(
         !screen.contains("Inspecting directory structure"),
         "screen: {screen}"
@@ -245,7 +250,7 @@ fn replay_history_keeps_spacing_before_final_reasoning() {
 
     let exploring_idx = lines
         .iter()
-        .position(|line| line.contains("Exploring..."))
+        .position(|line| line.contains("Exploring") && line.contains("working for"))
         .expect("exploring line present");
     let reasoning_idx = lines
         .iter()

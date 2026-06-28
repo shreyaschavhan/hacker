@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::thread;
@@ -12,7 +11,7 @@ use crossterm::SynchronizedUpdate;
 use code_cloud_tasks_client::{CloudTaskError, TaskId};
 use code_core::config::add_project_allowed_command;
 use code_core::config_types::Notifications;
-use code_core::protocol::{Event, Op, SandboxPolicy};
+use code_core::protocol::{Op, SandboxPolicy};
 use code_core::SessionCatalog;
 use code_login::{AuthManager, AuthMode, ServerOptions};
 use portable_pty::PtySize;
@@ -1390,7 +1389,9 @@ impl App<'_> {
                         }
                         #[cfg(debug_assertions)]
                         SlashCommand::TestApproval => {
+                            use std::path::PathBuf;
                             use code_core::protocol::EventMsg;
+                            use code_core::protocol::Event;
                             use std::collections::HashMap;
 
                             use code_core::protocol::ApplyPatchApprovalRequestEvent;

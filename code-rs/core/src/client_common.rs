@@ -833,6 +833,7 @@ mod tests {
         assert!(text.contains("[INFERRED - High confidence"));
         assert!(text.contains("[ASSUMED]"));
         assert!(!text.contains("[UNKNOWN]"));
+        assert!(!text.contains("tag checklist"));
     }
 
     #[test]

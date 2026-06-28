@@ -150,3 +150,13 @@ This architecture separates concerns between execution logic (core), UI state ma
 - Adjust the poll cadence via `--interval <seconds>` (defaults to 8). The script exits 0 on success and 1 on failure, so it can gate local automation.
 - Pass `--failure-logs` to automatically dump logs for any job that does not finish successfully.
 - Dependencies: GitHub CLI (`gh`) and `jq` must be available in `PATH`.
+
+## Shreyas Personal Fork Context
+
+- This workspace is for Shreyas's personalized harness fork. Push completed user-requested changes to the `hacker` remote: `https://github.com/shreyaschavhan/hacker.git`.
+- `origin` points at `https://github.com/just-every/code.git`; treat it as the source project remote, not the personal fork push target unless the user explicitly says otherwise.
+- Active implementation work should happen in `code-rs/`. Keep `codex-rs/` read-only as the upstream mirror.
+- The local custom command is intended to be `hacker`, backed by the rebuilt `code` binary. After release builds, verify the `hacker` command still resolves to the rebuilt binary before telling the user to try it.
+- For Rust commands in shells where Cargo is not on `PATH`, use `/Users/shreyas/.cargo/bin/cargo`.
+- Current feature work has been done in the isolated worktree `/Users/shreyas/.config/superpowers/worktrees/just-every-code/process-probe-review` on branch `feature/process-probe-review`.
+- Do not rebase when preparing to push. Commit local work, fetch, merge as needed, validate, then push to `hacker`.

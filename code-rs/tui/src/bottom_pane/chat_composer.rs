@@ -108,7 +108,14 @@ pub(crate) enum AutoReviewPhase {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewFooterSource {
+    AutoReview,
+    ProbeReview,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AutoReviewFooterStatus {
+    pub(crate) source: ReviewFooterSource,
     pub(crate) status: AutoReviewIndicatorStatus,
     pub(crate) findings: Option<usize>,
     pub(crate) phase: AutoReviewPhase,
@@ -404,10 +411,19 @@ impl ChatComposer {
         let mapped = Self::map_status_message(&message);
         if mapped != self.status_message {
             self.status_message = mapped;
-            self.status_started_at = self.is_task_running.then(Instant::now);
-        } else if self.is_task_running && self.status_started_at.is_none() {
+        }
+        if self.is_task_running && self.status_started_at.is_none() {
             self.status_started_at = Some(Instant::now());
         }
+    }
+
+    pub(crate) fn task_running_elapsed(&self) -> Option<Duration> {
+        if !self.is_task_running {
+            return None;
+        }
+
+        self.status_started_at
+            .map(|started| Instant::now().saturating_duration_since(started))
     }
 
     fn format_running_elapsed(duration: Duration) -> String {
@@ -2292,6 +2308,10 @@ impl ChatComposer {
     ) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         let key_hint_style = Style::default().fg(crate::colors::function());
         let label_style = Style::default().fg(crate::colors::text_dim());
+        let source_label = match status.source {
+            ReviewFooterSource::AutoReview => "Auto Review",
+            ReviewFooterSource::ProbeReview => "Probe Review",
+        };
 
         let agent_hint_label_text = match agent_hint_label {
             AgentHintLabel::Review => " show review",
@@ -2305,41 +2325,60 @@ impl ChatComposer {
 
         let status_spans = match status.status {
             AutoReviewIndicatorStatus::Running => {
-                let phase_label = match status.phase {
-                    AutoReviewPhase::Resolving => "Auto Review: Resolving",
-                    AutoReviewPhase::Reviewing => "Auto Review: Reviewing",
+                let phase_text = match status.phase {
+                    AutoReviewPhase::Resolving => "Resolving",
+                    AutoReviewPhase::Reviewing => "Reviewing",
                 };
                 let status_style = key_hint_style;
                 vec![
-                    Span::styled("Auto Review: ", label_style),
+                    Span::styled(format!("{source_label}: "), label_style),
                     Span::styled("•", status_style),
                     Span::from(" "),
-                    Span::styled(
-                        phase_label.trim_start_matches("Auto Review: "),
-                        status_style,
-                    ),
+                    Span::styled(phase_text, status_style),
                 ]
             }
             AutoReviewIndicatorStatus::Clean => {
                 let icon_style = key_hint_style;
+                let text = match status.source {
+                    ReviewFooterSource::AutoReview => "Correct",
+                    ReviewFooterSource::ProbeReview => "Adequate",
+                };
                 vec![
-                    Span::styled("Auto Review: ", label_style),
+                    Span::styled(format!("{source_label}: "), label_style),
                     Span::styled("✔", icon_style),
                     Span::from(" "),
-                    Span::styled("Correct", icon_style),
+                    Span::styled(text, icon_style),
                 ]
             }
             AutoReviewIndicatorStatus::Fixed => {
-                let icon_style = Style::default().fg(crate::colors::success());
-                let text = if let Some(count) = status.findings {
-                    let plural = if count == 1 { "Issue" } else { "Issues" };
-                    format!("{count} {plural} Fixed")
-                } else {
-                    "Issues Fixed".to_string()
+                let icon_style = match status.source {
+                    ReviewFooterSource::AutoReview => Style::default().fg(crate::colors::success()),
+                    ReviewFooterSource::ProbeReview => Style::default().fg(crate::colors::warning()),
+                };
+                let (icon, text) = match status.source {
+                    ReviewFooterSource::AutoReview => {
+                        let text = if let Some(count) = status.findings {
+                            let plural = if count == 1 { "Issue" } else { "Issues" };
+                            format!("{count} {plural} Fixed")
+                        } else {
+                            "Issues Fixed".to_string()
+                        };
+                        ("✔", text)
+                    }
+                    ReviewFooterSource::ProbeReview => {
+                        let text = if let Some(count) = status.findings {
+                            let plural = if count == 1 { "Issue" } else { "Issues" };
+                            let verb = if count == 1 { "Needs" } else { "Need" };
+                            format!("{count} {plural} {verb} Review")
+                        } else {
+                            "Resolution Required".to_string()
+                        };
+                        ("⚠", text)
+                    }
                 };
                 vec![
-                    Span::styled("Auto Review: ", label_style),
-                    Span::styled("✔", icon_style),
+                    Span::styled(format!("{source_label}: "), label_style),
+                    Span::styled(icon, icon_style),
                     Span::from(" "),
                     Span::styled(text, icon_style),
                 ]
@@ -2347,7 +2386,7 @@ impl ChatComposer {
             AutoReviewIndicatorStatus::Failed => {
                 let icon_style = Style::default().fg(crate::colors::error());
                 vec![
-                    Span::styled("Auto Review: ", label_style),
+                    Span::styled(format!("{source_label}: "), label_style),
                     Span::styled("✖", icon_style),
                     Span::from(" "),
                     Span::styled("Failed", icon_style),
@@ -3156,6 +3195,7 @@ mod tests {
         composer.auto_drive_active = true;
         composer.standard_terminal_hint = Some("Esc stop\tCtrl+S settings".to_string());
         composer.set_auto_review_status(Some(AutoReviewFooterStatus {
+            source: ReviewFooterSource::AutoReview,
             status: AutoReviewIndicatorStatus::Running,
             findings: None,
             phase: AutoReviewPhase::Reviewing,
@@ -3180,6 +3220,36 @@ mod tests {
         let esc_idx = line.find("Esc stop").unwrap_or(line.len());
 
         assert!(auto_idx < esc_idx, "Auto Review status should be left-most");
+    }
+
+    #[test]
+    fn probe_review_status_uses_probe_label() {
+        let (tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
+        let app_tx = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(true, app_tx, true, false);
+
+        composer.set_auto_review_status(Some(AutoReviewFooterStatus {
+            source: ReviewFooterSource::ProbeReview,
+            status: AutoReviewIndicatorStatus::Running,
+            findings: None,
+            phase: AutoReviewPhase::Reviewing,
+        }));
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 1,
+        };
+        let mut buf = Buffer::empty(area);
+        composer.render_footer(area, &mut buf);
+
+        let line: String = (0..area.width)
+            .map(|x| buf[(area.x + x, area.y)].symbol().to_string())
+            .collect();
+
+        assert!(line.contains("Probe Review"), "{line}");
+        assert!(!line.contains("Auto Review"), "{line}");
     }
 
     #[test]
@@ -3395,5 +3465,23 @@ mod tests {
         assert!(title.contains("Ctrl+C to interrupt"), "{title}");
         assert!(title.contains("1:35"), "{title}");
         assert!(!title.trim().is_empty());
+    }
+
+    #[test]
+    fn running_title_elapsed_does_not_reset_when_status_changes() {
+        let (tx, _rx) = std::sync::mpsc::channel::<AppEvent>();
+        let app_tx = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(true, app_tx, true, false);
+
+        composer.update_status_message("waiting for model".to_string());
+        composer.set_task_running(true);
+        composer.status_started_at = Some(Instant::now() - Duration::from_secs(64));
+
+        composer.update_status_message("running command".to_string());
+
+        let title = render_composer_input_title(&composer, 120);
+
+        assert!(title.contains("Using tools"), "{title}");
+        assert!(title.contains("1:04"), "{title}");
     }
 }

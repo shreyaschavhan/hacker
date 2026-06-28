@@ -203,7 +203,7 @@ use crate::bottom_pane::{
     AutoCoordinatorButton,
     AutoCoordinatorViewModel,
     CountdownState,
-    AgentHintLabel, AutoReviewFooterStatus, AutoReviewPhase,
+    AgentHintLabel, AutoReviewFooterStatus, AutoReviewPhase, ReviewFooterSource,
     prompts_settings_view::PromptsSettingsView,
     skills_settings_view::SkillsSettingsView,
     McpSettingsView,
@@ -245,6 +245,7 @@ const AUTO_COMPLETION_CELEBRATION_DURATION: Duration = Duration::from_secs(5);
 const HISTORY_ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(120);
 const IDLE_SPINNER_CLEAR_GRACE: Duration = Duration::from_millis(500);
 const MID_TURN_IDLE_SPINNER_CLEAR_GRACE: Duration = Duration::from_secs(15);
+const POST_TOOL_RESPONSE_GRACE: Duration = Duration::from_secs(15);
 const AUTO_BOOTSTRAP_GOAL_PLACEHOLDER: &str = "Deriving goal from recent conversation";
 const AUTO_DRIVE_SESSION_SUMMARY_NOTICE: &str = "Summarizing session";
 const AUTO_DRIVE_SESSION_SUMMARY_PROMPT: &str =
@@ -1333,6 +1334,7 @@ pub(crate) enum AutoReviewIndicatorStatus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AutoReviewStatus {
+    source: ReviewFooterSource,
     status: AutoReviewIndicatorStatus,
     findings: Option<usize>,
     phase: AutoReviewPhase,
@@ -1974,6 +1976,7 @@ pub(crate) struct ChatWidget<'a> {
     exec: ExecState,
     tools_state: ToolState,
     idle_spinner_clear_started_at: Option<Instant>,
+    post_tool_response_wait_started_at: Option<Instant>,
     idle_spinner_recheck_scheduled: bool,
     live_builder: RowBuilder,
     header_wave: HeaderWaveEffect,
@@ -4291,15 +4294,69 @@ impl ChatWidget<'_> {
         } else {
             self.idle_spinner_clear_started_at = None;
         }
+
+        let any_activity = any_tools_running
+            || any_streaming
+            || any_agents_active
+            || any_tasks_active
+            || terminal_running;
+
+        if any_activity {
+            self.post_tool_response_wait_started_at = None;
+        } else if !final_answer_seen
+            && self.bottom_pane.is_task_running()
+            && self
+                .bottom_pane
+                .status_message()
+                .is_some_and(Self::is_post_tool_followup_status)
+        {
+            let now = Instant::now();
+            let started_at = self
+                .post_tool_response_wait_started_at
+                .get_or_insert(now);
+            let elapsed = now.saturating_duration_since(*started_at);
+            if elapsed < POST_TOOL_RESPONSE_GRACE {
+                self.schedule_idle_spinner_recheck(POST_TOOL_RESPONSE_GRACE.saturating_sub(elapsed));
+                return;
+            }
+            self.post_tool_response_wait_started_at = None;
+        } else {
+            self.post_tool_response_wait_started_at = None;
+        }
+
         if !(any_tools_running
             || any_streaming
             || any_agents_active
             || any_tasks_active
             || terminal_running)
         {
-            self.bottom_pane.set_task_running(false);
+            self.finish_response_timing_with_notice();
             self.bottom_pane.update_status_text(String::new());
             self.flush_deferred_auto_review_notice_if_idle();
+        }
+    }
+
+    fn is_post_tool_followup_status(status: &str) -> bool {
+        matches!(
+            status.trim().to_ascii_lowercase().as_str(),
+            "responding" | "thinking" | "working"
+        )
+    }
+
+    fn begin_response_timing(&mut self, status: &str) {
+        self.bottom_pane.set_task_running(true);
+        self.bottom_pane.update_status_text(status.to_string());
+    }
+
+    fn finish_response_timing_with_notice(&mut self) {
+        let elapsed = self.bottom_pane.task_running_elapsed();
+        self.bottom_pane.set_task_running(false);
+
+        if let Some(elapsed) = elapsed {
+            self.bottom_pane.flash_footer_notice_for(
+                format!("Worked for {}.", format_duration(elapsed)),
+                Duration::from_secs(8),
+            );
         }
     }
 
@@ -4358,6 +4415,7 @@ impl ChatWidget<'_> {
     /// Ensure we show progress when work is visible but the spinner state drifted.
     fn ensure_spinner_for_activity(&mut self, reason: &'static str) {
         self.idle_spinner_clear_started_at = None;
+        self.post_tool_response_wait_started_at = None;
         if self.bottom_pane.auto_drive_style_active()
             && !self.bottom_pane.auto_drive_view_active()
             && !self.bottom_pane.has_active_modal_view()
@@ -4376,7 +4434,8 @@ impl ChatWidget<'_> {
     #[inline]
     fn stop_spinner(&mut self) {
         self.idle_spinner_clear_started_at = None;
-        self.bottom_pane.set_task_running(false);
+        self.post_tool_response_wait_started_at = None;
+        self.finish_response_timing_with_notice();
         self.bottom_pane.update_status_text(String::new());
         self.maybe_hide_spinner();
     }
@@ -5162,6 +5221,7 @@ impl ChatWidget<'_> {
         }
     }
 
+    #[cfg(debug_assertions)]
     fn reasoning_preview(lines: &[Line<'static>]) -> String {
         const MAX_LINES: usize = 3;
         const MAX_CHARS: usize = 120;
@@ -6814,7 +6874,7 @@ impl ChatWidget<'_> {
             Some(HistoryDomainRecord::Plain(state)),
         );
         let should_recover_auto = self.auto_state.is_active();
-        self.bottom_pane.set_task_running(false);
+        self.finish_response_timing_with_notice();
         // Ensure any running exec/tool cells are finalized so spinners don't linger
         // after errors.
         self.finalize_all_running_as_interrupted();
@@ -6894,6 +6954,7 @@ impl ChatWidget<'_> {
         }
 
         self.active_exec_cell = None;
+        self.finish_response_timing_with_notice();
         // Finalize any visible running indicators as interrupted (Exec/Web/Custom)
         self.finalize_all_running_as_interrupted();
         if bottom_running {
@@ -6909,7 +6970,6 @@ impl ChatWidget<'_> {
         self.submit_op(Op::Interrupt);
         // Immediately drop the running status so the next message can be typed/run,
         // even if backend cleanup (and Error event) arrives slightly later.
-        self.bottom_pane.set_task_running(false);
         self.bottom_pane.clear_live_ring();
         // Reset with max width to disable wrapping
         self.live_builder = RowBuilder::new(usize::MAX);
@@ -7077,6 +7137,7 @@ impl ChatWidget<'_> {
             canceled_exec_call_ids: HashSet::new(),
             tools_state: ToolState::default(),
             idle_spinner_clear_started_at: None,
+            post_tool_response_wait_started_at: None,
             idle_spinner_recheck_scheduled: false,
             // Use max width to disable wrapping during streaming
             // Text will be properly wrapped when displayed based on terminal width
@@ -7473,6 +7534,7 @@ impl ChatWidget<'_> {
                 auto_drive_tracker: None,
             },
             idle_spinner_clear_started_at: None,
+            post_tool_response_wait_started_at: None,
             idle_spinner_recheck_scheduled: false,
             live_builder: RowBuilder::new(usize::MAX),
             header_wave: {
@@ -11750,11 +11812,11 @@ impl ChatWidget<'_> {
             response,
         }) {
             tracing::error!("failed to send Op::UserInputAnswer: {e}");
+        } else {
+            self.begin_response_timing("waiting for model");
         }
 
         self.clear_composer();
-        self.bottom_pane
-            .update_status_text("waiting for model".to_string());
         self.request_redraw();
     }
 
@@ -12562,6 +12624,8 @@ impl ChatWidget<'_> {
                 })
             {
                 tracing::error!("failed to send Op::UserInput: {e}");
+            } else {
+                self.begin_response_timing("waiting for model");
             }
         }
 
@@ -12585,6 +12649,7 @@ impl ChatWidget<'_> {
         );
         match self.code_op_tx.send(Op::QueueUserInput { items }) {
             Ok(()) => {
+                self.begin_response_timing("waiting for model");
                 self.finalize_sent_user_message(message, dispatched_text);
             }
             Err(err) => {
@@ -12616,6 +12681,7 @@ impl ChatWidget<'_> {
             let dispatched_text = Self::combined_input_text(&items);
             match self.code_op_tx.send(Op::QueueUserInput { items }) {
                 Ok(()) => {
+                    self.begin_response_timing("waiting for model");
                     self.finalize_sent_user_message(message, dispatched_text);
                 }
                 Err(err) => {
@@ -14536,7 +14602,7 @@ impl ChatWidget<'_> {
                 let any_tasks_active = !self.active_task_ids.is_empty();
 
                 if !(any_tools_running || any_streaming || any_agents_active || any_tasks_active) {
-                    self.bottom_pane.set_task_running(false);
+                    self.finish_response_timing_with_notice();
                     // Ensure any transient footer text like "responding" is cleared when truly idle
                     self.bottom_pane.update_status_text(String::new());
                 }
@@ -15081,6 +15147,9 @@ impl ChatWidget<'_> {
                 changes,
             }) => {
                 self.probe_review_turn.record_file_change();
+                self.ensure_spinner_for_activity("patch-begin");
+                self.bottom_pane
+                    .update_status_text("applying patch".to_string());
                 let exec_call_id = ExecCallId(call_id.clone());
                 self.exec.suppress_exec_end(exec_call_id);
                 self.diffs.record_patch_set(&changes, true);
@@ -30065,6 +30134,8 @@ Have we met every part of this goal and is there no further work to do?"#
             final_output_json_schema: None,
         }) {
             tracing::error!("failed to send immediate UserInput: {e}");
+        } else {
+            self.begin_response_timing("waiting for model");
         }
 
         self.finalize_sent_user_message(message, dispatched_text);
@@ -31170,6 +31241,7 @@ use code_core::protocol::OrderMeta;
         McpServerFailure,
         McpServerFailurePhase,
         Op,
+        PatchApplyBeginEvent,
         TaskCompleteEvent,
     };
     use code_core::protocol::AgentInfo as CoreAgentInfo;
@@ -35792,6 +35864,112 @@ use code_core::protocol::OrderMeta;
     }
 
     #[test]
+    fn prompt_submission_starts_visible_elapsed_timer_before_task_started() {
+        let _rt = enter_test_runtime_guard();
+        let mut harness = ChatWidgetHarness::new();
+        {
+            let chat = harness.chat();
+            reset_history(chat);
+            let mut code_op_rx = replace_code_op_channel(chat);
+
+            chat.submit_text_message("hello".to_string());
+
+            let submitted = expect_immediate_user_input(&mut code_op_rx);
+            assert_eq!(submitted, "hello");
+            assert!(
+                chat.bottom_pane.is_task_running(),
+                "submitting a prompt should show working status before TaskStarted arrives"
+            );
+        }
+
+        let frame = crate::test_helpers::render_chat_widget_to_vt100(&mut harness, 96, 24);
+        assert!(
+            frame.contains("Thinking") && frame.contains("0:00"),
+            "prompt submission should show a live elapsed timer before backend events:\n{frame}"
+        );
+    }
+
+    #[test]
+    fn task_complete_shows_final_worked_for_duration_notice() {
+        let mut harness = ChatWidgetHarness::new();
+        {
+            let chat = harness.chat();
+            reset_history(chat);
+        }
+
+        harness.handle_event(Event {
+            id: "turn-1".to_string(),
+            event_seq: 0,
+            msg: EventMsg::TaskStarted,
+            order: None,
+        });
+        harness.handle_event(Event {
+            id: "turn-1".to_string(),
+            event_seq: 1,
+            msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                last_agent_message: None,
+            }),
+            order: None,
+        });
+        harness.flush_into_widget();
+
+        let frame = crate::test_helpers::render_chat_widget_to_vt100(&mut harness, 96, 24);
+        assert!(
+            frame.contains("Worked for"),
+            "task completion should leave a final worked-duration notice:\n{frame}"
+        );
+    }
+
+    #[test]
+    fn fatal_error_shows_final_worked_for_duration_notice() {
+        let mut harness = ChatWidgetHarness::new();
+        {
+            let chat = harness.chat();
+            reset_history(chat);
+        }
+
+        harness.handle_event(Event {
+            id: "turn-1".to_string(),
+            event_seq: 0,
+            msg: EventMsg::TaskStarted,
+            order: None,
+        });
+        harness.handle_event(Event {
+            id: "turn-1".to_string(),
+            event_seq: 1,
+            msg: EventMsg::Error(ErrorEvent {
+                message: "fatal model failure".to_string(),
+            }),
+            order: None,
+        });
+        harness.flush_into_widget();
+
+        let frame = crate::test_helpers::render_chat_widget_to_vt100(&mut harness, 96, 24);
+        assert!(
+            frame.contains("Worked for"),
+            "fatal errors should leave a final worked-duration notice:\n{frame}"
+        );
+    }
+
+    #[test]
+    fn cancel_shows_final_worked_for_duration_notice() {
+        let mut harness = ChatWidgetHarness::new();
+        {
+            let chat = harness.chat();
+            reset_history(chat);
+            chat.bottom_pane.set_task_running(true);
+            chat.bottom_pane.update_status_text("responding".to_string());
+            assert!(chat.on_esc(), "Esc should cancel active task");
+        }
+
+        let frame = crate::test_helpers::render_chat_widget_to_vt100(&mut harness, 96, 24);
+        assert!(
+            frame.contains("Cancelled by user.") && frame.contains("Worked for"),
+            "cancellation should leave confirmation and final worked-duration notice:\n{frame}"
+        );
+    }
+
+    #[test]
     fn spinner_rearms_when_late_agent_update_reports_running() {
         let mut harness = ChatWidgetHarness::new();
         let chat = harness.chat();
@@ -36141,6 +36319,82 @@ use code_core::protocol::OrderMeta;
         assert!(
             frame.contains("0:00"),
             "running exec should include elapsed time:\n{frame}"
+        );
+    }
+
+    #[test]
+    fn patch_apply_begin_rearms_visible_working_title_after_idle_clear() {
+        let _rt = enter_test_runtime_guard();
+        let mut harness = ChatWidgetHarness::new();
+        {
+            let chat = harness.chat();
+            reset_history(chat);
+            chat.bottom_pane.set_task_running(false);
+            chat.bottom_pane.update_status_text(String::new());
+        }
+
+        harness.handle_event(Event {
+            id: "patch-begin".to_string(),
+            event_seq: 1,
+            msg: EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
+                call_id: "patch-1".to_string(),
+                auto_approved: true,
+                changes: HashMap::new(),
+            }),
+            order: Some(OrderMeta {
+                request_ordinal: 1,
+                output_index: Some(0),
+                sequence_number: Some(0),
+            }),
+        });
+
+        harness.flush_into_widget();
+
+        assert!(
+            harness.chat().bottom_pane.is_task_running(),
+            "patch begin should re-enable the composer working title"
+        );
+        let frame = crate::test_helpers::render_chat_widget_to_vt100(&mut harness, 96, 24);
+        assert!(
+            frame.contains("Coding") || frame.contains("Using tools") || frame.contains("Working"),
+            "patch begin should show a nonblank working title:\n{frame}"
+        );
+    }
+
+    #[test]
+    fn post_tool_responding_status_survives_initial_idle_check() {
+        let _rt = enter_test_runtime_guard();
+        let mut harness = ChatWidgetHarness::new();
+        {
+            let chat = harness.chat();
+            reset_history(chat);
+            chat.bottom_pane.set_task_running(true);
+            chat.bottom_pane.update_status_text("responding".to_string());
+            chat.maybe_hide_spinner();
+        }
+
+        assert!(
+            harness.chat().bottom_pane.is_task_running(),
+            "post-tool responding grace should keep the composer visibly working"
+        );
+        let frame = crate::test_helpers::render_chat_widget_to_vt100(&mut harness, 96, 24);
+        assert!(
+            frame.contains("Responding"),
+            "post-tool grace should keep a visible responding title:\n{frame}"
+        );
+
+        {
+            let chat = harness.chat();
+            chat.post_tool_response_wait_started_at = Some(
+                Instant::now()
+                    .checked_sub(POST_TOOL_RESPONSE_GRACE + Duration::from_millis(50))
+                    .expect("timestamp should subtract"),
+            );
+            chat.maybe_hide_spinner();
+        }
+        assert!(
+            !harness.chat().bottom_pane.is_task_running(),
+            "post-tool responding grace should eventually clear if no work resumes"
         );
     }
 
@@ -37671,7 +37925,7 @@ impl ChatWidget<'_> {
             agent_id: None,
             last_seen: std::time::Instant::now(),
         });
-        self.push_background_tail("Probe Review: reviewing high-risk process conclusion.");
+        self.set_probe_review_indicator(AutoReviewIndicatorStatus::Running, None);
 
         let config = self.config.clone();
         tokio::spawn(async move {
@@ -37813,7 +38067,11 @@ impl ChatWidget<'_> {
         let had_notice = self.auto_review_notice.is_some();
         let had_fixed_indicator = matches!(
             self.auto_review_status,
-            Some(AutoReviewStatus { status: AutoReviewIndicatorStatus::Fixed, .. })
+            Some(AutoReviewStatus {
+                source: ReviewFooterSource::AutoReview,
+                status: AutoReviewIndicatorStatus::Fixed,
+                ..
+            })
         );
         self.background_review = Some(BackgroundReviewState {
             worktree_path: std::path::PathBuf::new(),
@@ -37893,7 +38151,10 @@ impl ChatWidget<'_> {
             let phase = detect_auto_review_phase(agent.last_progress.as_deref());
 
             if matches!(status, AgentStatus::Running | AgentStatus::Pending) {
-                let findings = self.auto_review_status.and_then(|s| s.findings);
+                let findings = self
+                    .auto_review_status
+                    .filter(|state| matches!(state.source, ReviewFooterSource::AutoReview))
+                    .and_then(|state| state.findings);
                 self.set_auto_review_indicator(
                     AutoReviewIndicatorStatus::Running,
                     findings,
@@ -37902,10 +38163,14 @@ impl ChatWidget<'_> {
                 continue;
             }
 
-            if let Some(mut state) = self.auto_review_status {
+            if let Some(mut state) = self
+                .auto_review_status
+                .filter(|state| matches!(state.source, ReviewFooterSource::AutoReview))
+            {
                 state.phase = phase;
                 self.auto_review_status = Some(state);
                 self.bottom_pane.set_auto_review_status(Some(AutoReviewFooterStatus {
+                    source: state.source,
                     status: state.status,
                     findings: state.findings,
                     phase,
@@ -37979,6 +38244,11 @@ impl ChatWidget<'_> {
 
             let status = agent_status_from_str(agent.status.as_str());
             if matches!(status, AgentStatus::Pending | AgentStatus::Running) {
+                let findings = self
+                    .auto_review_status
+                    .filter(|state| matches!(state.source, ReviewFooterSource::ProbeReview))
+                    .and_then(|state| state.findings);
+                self.set_probe_review_indicator(AutoReviewIndicatorStatus::Running, findings);
                 continue;
             }
             if !matches!(
@@ -37995,6 +38265,7 @@ impl ChatWidget<'_> {
             self.probe_review_run = None;
 
             if let Some(error) = agent.error.as_deref().map(str::trim).filter(|err| !err.is_empty()) {
+                self.set_probe_review_indicator(AutoReviewIndicatorStatus::Failed, None);
                 self.history_push_plain_paragraphs(
                     PlainMessageKind::Notice,
                     vec![
@@ -38005,7 +38276,17 @@ impl ChatWidget<'_> {
                 continue;
             }
 
+            if matches!(status, AgentStatus::Failed | AgentStatus::Cancelled) {
+                self.set_probe_review_indicator(AutoReviewIndicatorStatus::Failed, None);
+                self.history_push_plain_paragraphs(
+                    PlainMessageKind::Notice,
+                    ["Probe Review: failed before producing a result."],
+                );
+                continue;
+            }
+
             let Some(raw_result) = agent.result.as_deref() else {
+                self.set_probe_review_indicator(AutoReviewIndicatorStatus::Failed, None);
                 self.history_push_plain_paragraphs(
                     PlainMessageKind::Notice,
                     ["Probe Review: finished without a result."],
@@ -38016,6 +38297,7 @@ impl ChatWidget<'_> {
             match parse_probe_review_result(raw_result) {
                 Ok(result) => self.handle_probe_review_result(result),
                 Err(err) => {
+                    self.set_probe_review_indicator(AutoReviewIndicatorStatus::Failed, None);
                     self.history_push_plain_paragraphs(
                         PlainMessageKind::Notice,
                         vec![
@@ -38029,6 +38311,14 @@ impl ChatWidget<'_> {
     }
 
     fn handle_probe_review_result(&mut self, result: ProbeReviewResult) {
+        if result.resolution_required {
+            let findings = (!result.critical_failures.is_empty())
+                .then_some(result.critical_failures.len());
+            self.set_probe_review_indicator(AutoReviewIndicatorStatus::Fixed, findings);
+        } else {
+            self.set_probe_review_indicator(AutoReviewIndicatorStatus::Clean, None);
+        }
+
         let lines = probe_notice_lines(&result);
         self.history_push_plain_paragraphs(PlainMessageKind::Notice, lines);
 
@@ -38479,6 +38769,7 @@ impl ChatWidget<'_> {
         phase: AutoReviewPhase,
     ) {
         let state = AutoReviewStatus {
+            source: ReviewFooterSource::AutoReview,
             status,
             findings,
             phase,
@@ -38486,16 +38777,47 @@ impl ChatWidget<'_> {
         self.auto_review_status = Some(state);
         self.bottom_pane
             .set_auto_review_status(Some(AutoReviewFooterStatus {
+                source: ReviewFooterSource::AutoReview,
                 status,
                 findings,
                 phase,
+        }));
+        self.request_redraw();
+    }
+
+    fn set_probe_review_indicator(
+        &mut self,
+        status: AutoReviewIndicatorStatus,
+        findings: Option<usize>,
+    ) {
+        let state = AutoReviewStatus {
+            source: ReviewFooterSource::ProbeReview,
+            status,
+            findings,
+            phase: AutoReviewPhase::Reviewing,
+        };
+        self.auto_review_status = Some(state);
+        self.bottom_pane
+            .set_auto_review_status(Some(AutoReviewFooterStatus {
+                source: ReviewFooterSource::ProbeReview,
+                status,
+                findings,
+                phase: AutoReviewPhase::Reviewing,
             }));
         self.request_redraw();
     }
 
     fn clear_auto_review_indicator(&mut self) {
-        self.auto_review_status = None;
-        self.bottom_pane.set_auto_review_status(None);
+        if matches!(
+            self.auto_review_status,
+            Some(AutoReviewStatus {
+                source: ReviewFooterSource::AutoReview,
+                ..
+            })
+        ) {
+            self.auto_review_status = None;
+            self.bottom_pane.set_auto_review_status(None);
+        }
     }
 
     fn remember_processed_auto_review_agent(&mut self, agent_id: &str) {
@@ -43259,7 +43581,10 @@ impl WidgetRef for &ChatWidget<'_> {
             preview: String,
         }
 
+        #[cfg(debug_assertions)]
         let mut height_mismatches: Vec<HeightMismatch> = Vec::new();
+        #[cfg(not(debug_assertions))]
+        let height_mismatches: Vec<HeightMismatch> = Vec::new();
         let is_collapsed_reasoning_at = |idx: usize| {
             if idx >= request_count {
                 return false;

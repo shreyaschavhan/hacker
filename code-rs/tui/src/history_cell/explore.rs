@@ -7,10 +7,12 @@ use crate::history::state::{
     ExploreRecord,
     ExploreSummary,
 };
+use code_common::elapsed::format_duration;
 use code_core::parse_command::ParsedCommand;
 use code_core::util::extract_shell_script;
 use shlex::Shlex;
 use std::path::{Component, Path};
+use std::time::{Duration, SystemTime};
 
 pub(crate) struct ExploreAggregationCell {
     record: ExploreRecord,
@@ -80,6 +82,13 @@ impl HistoryCell for ExploreAggregationCell {
 
     fn display_lines(&self) -> Vec<Line<'static>> {
         explore_lines_from_record_with_force(&self.record, self.force_exploring_header)
+    }
+
+    fn is_animating(&self) -> bool {
+        self.record
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.status, ExploreEntryStatus::Running))
     }
 
     fn desired_height(&self, width: u16) -> u16 {
@@ -315,7 +324,11 @@ fn explore_lines_with_truncation(
             .entries
             .iter()
             .any(|entry| matches!(entry.status, ExploreEntryStatus::Running));
-    let header = if exploring { "Exploring..." } else { "Explored" };
+    let has_running_entry = record
+        .entries
+        .iter()
+        .any(|entry| matches!(entry.status, ExploreEntryStatus::Running));
+    let header = explore_header(record, exploring, has_running_entry);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::styled(
@@ -374,7 +387,7 @@ fn explore_lines_with_truncation(
         spans.extend(entry_summary_spans(entry));
         match entry.status {
             ExploreEntryStatus::Running => spans.push(Span::styled(
-                "…",
+                format!(" {} running", explore_spinner_frame()),
                 Style::default().fg(crate::colors::text_dim()),
             )),
             ExploreEntryStatus::NotFound => spans.push(Span::styled(
@@ -402,6 +415,40 @@ fn explore_lines_with_truncation(
     }
 
     lines
+}
+
+fn explore_header(record: &ExploreRecord, exploring: bool, has_running_entry: bool) -> String {
+    if !exploring {
+        return "Explored".to_string();
+    }
+    if !has_running_entry {
+        return "Exploring...".to_string();
+    }
+
+    let elapsed = record
+        .started_at
+        .elapsed()
+        .unwrap_or_else(|_| Duration::from_secs(0));
+    let working_label = if elapsed >= Duration::from_secs(30) {
+        "still working for"
+    } else {
+        "working for"
+    };
+    format!(
+        "Exploring {} ({} {})",
+        explore_spinner_frame(),
+        working_label,
+        format_duration(elapsed)
+    )
+}
+
+fn explore_spinner_frame() -> &'static str {
+    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+    let millis = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    FRAMES[((millis / 120) as usize) % FRAMES.len()]
 }
 
 pub(crate) fn explore_lines_without_truncation(
@@ -511,6 +558,52 @@ fn entry_summary_spans(entry: &ExploreEntry) -> Vec<Span<'static>> {
             }
             spans
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn running_record() -> ExploreRecord {
+        ExploreRecord {
+            id: crate::history::state::HistoryId::ZERO,
+            started_at: SystemTime::now()
+                .checked_sub(Duration::from_secs(12))
+                .unwrap_or(SystemTime::UNIX_EPOCH),
+            entries: vec![ExploreEntry {
+                action: ExecAction::Read,
+                summary: ExploreSummary::Read {
+                    display_path: "execution-dashboard.md".to_string(),
+                    annotation: Some("(lines 1 to 220)".to_string()),
+                    range: Some((1, 220)),
+                },
+                status: ExploreEntryStatus::Running,
+            }],
+        }
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn running_explore_aggregation_is_animating() {
+        let cell = ExploreAggregationCell::from_record(running_record());
+
+        assert!(cell.is_animating());
+    }
+
+    #[test]
+    fn running_explore_header_shows_elapsed_feedback() {
+        let lines = explore_lines_from_record(&running_record());
+        let header = line_text(lines.first().expect("header line"));
+
+        assert!(header.contains("Exploring"));
+        assert!(header.contains("working for"), "{header}");
     }
 }
 

@@ -74,7 +74,9 @@ pub(crate) enum CancellationEvent {
     Handled,
 }
 
-pub(crate) use chat_composer::{AgentHintLabel, AutoReviewFooterStatus, AutoReviewPhase, ChatComposer};
+pub(crate) use chat_composer::{
+    AgentHintLabel, AutoReviewFooterStatus, AutoReviewPhase, ChatComposer, ReviewFooterSource,
+};
 pub(crate) use chat_composer::InputResult;
 pub(crate) use auto_coordinator_view::{
     AutoActiveViewModel,
@@ -692,6 +694,14 @@ impl BottomPane<'_> {
 
     pub(crate) fn is_task_running(&self) -> bool {
         self.is_task_running
+    }
+
+    pub(crate) fn task_running_elapsed(&self) -> Option<Duration> {
+        self.composer.task_running_elapsed()
+    }
+
+    pub(crate) fn status_message(&self) -> Option<&str> {
+        self.composer.status_message()
     }
 
     // is_normal_backtrack_mode removed; App-level policy handles Esc behavior directly.

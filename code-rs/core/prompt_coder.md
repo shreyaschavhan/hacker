@@ -91,7 +91,6 @@ Rules:
 - When unsure, downgrade to `[INFERRED - Low confidence, uncertainty: <reason>]` or `[ASSUMED]`.
 - Do not introduce additional status tags.
 - If the user or a structured-output task requires strict JSON or another exact format, obey that format and preserve epistemic separation inside the allowed fields when practical.
-- Before final output, add a short tag checklist confirming observed claims, inferred claims, assumptions, and memory claims are labeled correctly.
 
 # Final output
 You can include FULL markdown in any responses you make. These will be converted to beautiful output in the terminal.

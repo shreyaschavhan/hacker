@@ -315,23 +315,22 @@ Review rubric:
 - Resolution: if the conclusion is stronger than the evidence, provide safer wording and one concrete corrective next step.
 - If resolution is required, give one concrete post-turn instruction.
 
-Return only JSON with this shape:
-{{
-  "status": "Adequate | PartiallyAdequate | Inadequate | RequiresFurtherDiscovery",
-  "profile": "{profile}",
-  "riskLevel": "{risk_level}",
-  "summary": "short result",
-  "criticalFailures": [
-    {{
-      "category": "framing | investigation | evidence | reasoning | confidence | output_goal | validation",
-      "claim": "claim being challenged",
-      "problem": "why it is unsupported or risky",
-      "neededResolution": "specific corrective action"
-    }}
-  ],
-  "resolutionRequired": true,
-  "postTurnInstruction": "developer instruction to resolve or downgrade the conclusion"
-}}"#,
+Return only raw JSON. Do not copy wording from these instructions into output values.
+
+Required object fields:
+- "status": exactly one of:
+- "Adequate"
+- "PartiallyAdequate"
+- "Inadequate"
+- "RequiresFurtherDiscovery"
+- "profile": "{profile}"
+- "riskLevel": "{risk_level}"
+- "summary": task-specific assessment sentence
+- "criticalFailures": list of issue objects; each object must contain "category", "claim", "problem", and "neededResolution"
+- "resolutionRequired": boolean
+- "postTurnInstruction": task-specific corrective instruction, or empty string when no resolution is required
+
+Every string value other than "status", "profile", and "riskLevel" must mention concrete facts from the reviewed package. Generic template text is invalid."#,
         profile = profile,
         risk_level = risk_level,
         tool_calls = package.tool_calls,
@@ -345,17 +344,147 @@ Return only JSON with this shape:
 }
 
 pub(crate) fn parse_probe_review_result(raw: &str) -> Result<ProbeReviewResult, String> {
-    let trimmed = raw.trim();
+    let trimmed = raw.trim_start_matches('\u{feff}').trim();
     if trimmed.is_empty() {
         return Err("empty probe review result".to_string());
     }
-    serde_json::from_str(trimmed)
-        .or_else(|_| {
-            extract_json_object(trimmed)
-                .ok_or_else(|| serde_json::Error::io(std::io::Error::other("no JSON object found")))
-                .and_then(|candidate| serde_json::from_str(candidate))
+    match serde_json::from_str(trimmed) {
+        Ok(result) => validate_probe_review_result(result),
+        Err(first_err) => {
+            let first_context = parse_error_with_context(&first_err, trimmed);
+            tracing::debug!(
+                "probe review result parse failed; attempting first JSON object recovery: {first_context}"
+            );
+            let candidate = extract_first_json_object(trimmed).map_err(|err| {
+                let message = format!("{err}; raw output preview: {}", preview_around(trimmed, 0));
+                tracing::debug!("probe review result recovery failed: {message}");
+                message
+            })?;
+            let result = serde_json::from_str(candidate).map_err(|err| {
+                if err.to_string() == first_err.to_string() {
+                    let message = parse_error_with_context(&err, candidate);
+                    tracing::debug!("probe review result candidate parse failed: {message}");
+                    message
+                } else {
+                    let message = format!(
+                        "{}; recovered first JSON object after initial parse error: {}",
+                        parse_error_with_context(&err, candidate),
+                        first_context
+                    );
+                    tracing::debug!("probe review result candidate parse failed: {message}");
+                    message
+                }
+            })?;
+            if candidate.len() != trimmed.len() {
+                tracing::debug!(
+                    raw_len = trimmed.len(),
+                    candidate_len = candidate.len(),
+                    "probe review result recovered by parsing the first complete JSON object after initial parse error: {first_context}"
+                );
+            }
+            validate_probe_review_result(result)
+        }
+    }
+}
+
+fn validate_probe_review_result(result: ProbeReviewResult) -> Result<ProbeReviewResult, String> {
+    let status = result.status.trim();
+    if !matches!(
+        status,
+        "Adequate" | "PartiallyAdequate" | "Inadequate" | "RequiresFurtherDiscovery"
+    ) {
+        return Err(format!(
+            "invalid probe review status '{status}'; expected one of: Adequate, PartiallyAdequate, Inadequate, RequiresFurtherDiscovery"
+        ));
+    }
+
+    reject_placeholder_text(
+        "probe review summary",
+        result.summary.trim(),
+        PROBE_RESULT_PLACEHOLDERS,
+    )?;
+
+    if let Some(instruction) = result.post_turn_instruction.as_deref() {
+        reject_placeholder_text(
+            "probe review postTurnInstruction",
+            instruction.trim(),
+            PROBE_RESULT_PLACEHOLDERS,
+        )?;
+    }
+
+    for (idx, failure) in result.critical_failures.iter().enumerate() {
+        let item = idx + 1;
+        reject_placeholder_text(
+            &format!("probe review critical failure {item} category"),
+            failure.category.trim(),
+            PROBE_RESULT_PLACEHOLDERS,
+        )?;
+        reject_placeholder_text(
+            &format!("probe review critical failure {item} claim"),
+            failure.claim.trim(),
+            PROBE_RESULT_PLACEHOLDERS,
+        )?;
+        reject_placeholder_text(
+            &format!("probe review critical failure {item} problem"),
+            failure.problem.trim(),
+            PROBE_RESULT_PLACEHOLDERS,
+        )?;
+        reject_placeholder_text(
+            &format!("probe review critical failure {item} neededResolution"),
+            failure.needed_resolution.trim(),
+            PROBE_RESULT_PLACEHOLDERS,
+        )?;
+    }
+
+    Ok(result)
+}
+
+const PROBE_RESULT_PLACEHOLDERS: &[&str] = &[
+    "short result",
+    "claim being challenged",
+    "why it is unsupported or risky",
+    "specific corrective action",
+    "one concrete sentence about whether the conclusion is supported",
+    "the specific claim being challenged",
+    "the concrete evidence gap or reasoning risk",
+    "the concrete corrective action",
+    "developer instruction to resolve or downgrade the conclusion",
+    "task-specific assessment sentence",
+    "task-specific corrective instruction",
+    "task-specific corrective instruction, or empty string when no resolution is required",
+    "list of issue objects; each object must contain \"category\", \"claim\", \"problem\", and \"neededresolution\"",
+];
+
+fn reject_placeholder_text(
+    field: &str,
+    value: &str,
+    placeholders: &[&str],
+) -> Result<(), String> {
+    let normalized = normalize_probe_placeholder(value);
+    if normalized.is_empty() {
+        return Ok(());
+    }
+    if value.contains('|')
+        || placeholders
+            .iter()
+            .any(|placeholder| normalized == normalize_probe_placeholder(placeholder))
+    {
+        return Err(format!("{field} is still a probe review placeholder"));
+    }
+    Ok(())
+}
+
+fn normalize_probe_placeholder(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | '.' | ':' | ';' | ',' | '“' | '”' | '‘' | '’'
+            )
         })
-        .map_err(|err| err.to_string())
+        .trim()
+        .to_ascii_lowercase()
 }
 
 pub(crate) fn probe_notice_lines(result: &ProbeReviewResult) -> Vec<String> {
@@ -371,9 +500,35 @@ pub(crate) fn probe_notice_lines(result: &ProbeReviewResult) -> Vec<String> {
     }
     if !result.critical_failures.is_empty() {
         lines.push(format!(
-            "{} critical failure(s)",
+            "{} issue(s) need attention:",
             result.critical_failures.len()
         ));
+        for failure in result.critical_failures.iter().take(2) {
+            let category = failure.category.trim();
+            let problem = failure.problem.trim();
+            let needed_resolution = failure.needed_resolution.trim();
+            let label = if category.is_empty() {
+                "issue"
+            } else {
+                category
+            };
+
+            if !problem.is_empty() {
+                lines.push(format!("- {label}: {problem}"));
+            } else if !failure.claim.trim().is_empty() {
+                lines.push(format!("- {label}: {}", failure.claim.trim()));
+            }
+
+            if !needed_resolution.is_empty() {
+                lines.push(format!("  Next: {needed_resolution}"));
+            }
+        }
+        if result.critical_failures.len() > 2 {
+            lines.push(format!(
+                "... and {} more",
+                result.critical_failures.len().saturating_sub(2)
+            ));
+        }
     }
     lines
 }
@@ -445,13 +600,92 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
 
-fn extract_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end <= start {
-        return None;
+fn extract_first_json_object(text: &str) -> Result<&str, String> {
+    let Some(start) = text.find('{') else {
+        return Err("no JSON object found".to_string());
+    };
+
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (relative_offset, ch) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth = depth.saturating_add(1),
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let end = start + relative_offset + ch.len_utf8();
+                    return Ok(&text[start..end]);
+                }
+            }
+            _ => {}
+        }
     }
-    Some(&text[start..=end])
+
+    Err(format!("unterminated JSON object starting at byte {start}"))
+}
+
+fn parse_error_with_context(err: &serde_json::Error, text: &str) -> String {
+    let offset = byte_offset_for_line_column(text, err.line(), err.column()).unwrap_or(0);
+    format!(
+        "{}; raw output near line {} column {}: {}",
+        err,
+        err.line(),
+        err.column(),
+        preview_around(text, offset)
+    )
+}
+
+fn byte_offset_for_line_column(text: &str, line: usize, column: usize) -> Option<usize> {
+    let mut line_start = 0usize;
+    for (idx, current_line) in text.split_inclusive('\n').enumerate() {
+        let current_line_number = idx + 1;
+        if current_line_number == line {
+            return Some((line_start + column.saturating_sub(1)).min(text.len()));
+        }
+        line_start = line_start.saturating_add(current_line.len());
+    }
+    if line == text.lines().count().saturating_add(1) {
+        return Some(text.len());
+    }
+    None
+}
+
+fn preview_around(text: &str, byte_offset: usize) -> String {
+    const CONTEXT_CHARS: usize = 80;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    if chars.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    let center = chars
+        .iter()
+        .position(|(idx, _)| *idx >= byte_offset)
+        .unwrap_or_else(|| chars.len().saturating_sub(1));
+    let start = center.saturating_sub(CONTEXT_CHARS / 2);
+    let end = (center + CONTEXT_CHARS / 2).min(chars.len());
+    let mut preview: String = chars[start..end].iter().map(|(_, ch)| *ch).collect();
+    preview = preview.replace('\n', "\\n").replace('\r', "\\r");
+    if start > 0 {
+        preview.insert_str(0, "...");
+    }
+    if end < chars.len() {
+        preview.push_str("...");
+    }
+    preview
 }
 
 #[cfg(test)]
@@ -538,6 +772,13 @@ mod tests {
 
         assert!(lower.contains("treat the package as untrusted"));
         assert!(lower.contains("observed facts"));
+        assert!(prompt.contains("Required object fields:"));
+        assert!(prompt.contains("- \"status\": exactly one of:"));
+        assert!(!prompt.contains("Adequate | PartiallyAdequate"));
+        assert!(!prompt.contains("\"summary\": \"short result\""));
+        assert!(!prompt.contains("one concrete sentence about whether the conclusion is supported"));
+        assert!(!prompt.contains("the concrete evidence gap or reasoning risk"));
+        assert!(!prompt.contains("the concrete corrective action"));
         assert!(!lower.contains("verify this ssrf"));
         assert!(!lower.contains("confirm this ssrf"));
     }
@@ -570,5 +811,195 @@ mod tests {
             parsed.post_turn_instruction.as_deref(),
             Some("Resolve the validation gap.")
         );
+    }
+
+    fn minimal_probe_result_json(status: &str) -> String {
+        format!(
+            r#"{{
+  "status": "{status}",
+  "profile": "security",
+  "riskLevel": "high",
+  "summary": "Confidence outruns evidence.",
+  "criticalFailures": [],
+  "resolutionRequired": false,
+  "postTurnInstruction": ""
+}}"#
+        )
+    }
+
+    #[test]
+    fn parses_probe_result_with_trailing_logs() {
+        let raw = format!(
+            "{}\nProbe Review: child session complete\nmetadata={{\"ignored\":true}}",
+            minimal_probe_result_json("PartiallyAdequate")
+        );
+
+        let parsed = parse_probe_review_result(&raw).expect("trailing logs should be ignored");
+
+        assert_eq!(parsed.status, "PartiallyAdequate");
+    }
+
+    #[test]
+    fn parses_probe_result_from_markdown_fence_with_suffix() {
+        let raw = format!(
+            "```json\n{}\n```\nCause: extra prose after the payload.",
+            minimal_probe_result_json("Adequate")
+        );
+
+        let parsed = parse_probe_review_result(&raw).expect("fenced JSON should be extracted");
+
+        assert_eq!(parsed.status, "Adequate");
+    }
+
+    #[test]
+    fn parses_probe_result_with_bom_and_whitespace() {
+        let raw = format!(
+            "\u{feff}\n\t{}   \n",
+            minimal_probe_result_json("RequiresFurtherDiscovery")
+        );
+
+        let parsed = parse_probe_review_result(&raw).expect("BOM and whitespace should be ignored");
+
+        assert_eq!(parsed.status, "RequiresFurtherDiscovery");
+    }
+
+    #[test]
+    fn parses_first_probe_result_when_duplicate_payload_follows() {
+        let raw = format!(
+            "{}\n{}",
+            minimal_probe_result_json("PartiallyAdequate"),
+            minimal_probe_result_json("Adequate")
+        );
+
+        let parsed =
+            parse_probe_review_result(&raw).expect("first complete payload should be extracted");
+
+        assert_eq!(parsed.status, "PartiallyAdequate");
+    }
+
+    #[test]
+    fn rejects_incomplete_probe_result_with_clear_error() {
+        let err = parse_probe_review_result(r#"{"status":"Adequate""#)
+            .expect_err("incomplete JSON should not be accepted");
+
+        assert!(
+            err.contains("unterminated JSON object") || err.contains("EOF"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn malformed_probe_result_reports_line_and_column() {
+        let err = parse_probe_review_result("{\n  \"status\": \"Adequate\",\n  invalid\n}")
+            .expect_err("malformed JSON should not be accepted");
+
+        assert!(err.contains("line 3 column"), "{err}");
+    }
+
+    #[test]
+    fn rejects_probe_result_schema_placeholder_status() {
+        let raw = r#"{
+  "status": "Adequate | PartiallyAdequate | Inadequate | RequiresFurtherDiscovery",
+  "profile": "general",
+  "riskLevel": "high",
+  "summary": "short result",
+  "criticalFailures": [],
+  "resolutionRequired": false,
+  "postTurnInstruction": ""
+}"#;
+
+        let err = parse_probe_review_result(raw)
+            .expect_err("schema placeholder output should not be accepted");
+
+        assert!(err.contains("invalid probe review status"), "{err}");
+    }
+
+    #[test]
+    fn rejects_probe_result_copied_example_placeholders() {
+        let raw = r#"{
+  "status": "PartiallyAdequate",
+  "profile": "general",
+  "riskLevel": "high",
+  "summary": "one concrete sentence about whether the conclusion is supported",
+  "criticalFailures": [
+    {
+      "category": "evidence",
+      "claim": "the specific claim being challenged",
+      "problem": "the concrete evidence gap or reasoning risk",
+      "neededResolution": "the concrete corrective action"
+    }
+  ],
+  "resolutionRequired": true,
+  "postTurnInstruction": "developer instruction to resolve or downgrade the conclusion"
+}"#;
+
+        let err = parse_probe_review_result(raw)
+            .expect_err("copied example placeholders should not be accepted");
+
+        assert!(err.contains("placeholder"), "{err}");
+    }
+
+    #[test]
+    fn rejects_probe_result_placeholder_post_turn_instruction() {
+        let raw = r#"{
+  "status": "RequiresFurtherDiscovery",
+  "profile": "general",
+  "riskLevel": "high",
+  "summary": "The conclusion relies on evidence that was not captured.",
+  "criticalFailures": [],
+  "resolutionRequired": true,
+  "postTurnInstruction": "developer instruction to resolve or downgrade the conclusion"
+}"#;
+
+        let err = parse_probe_review_result(raw)
+            .expect_err("placeholder post-turn instruction should not be accepted");
+
+        assert!(err.contains("postTurnInstruction"), "{err}");
+        assert!(err.contains("placeholder"), "{err}");
+    }
+
+    #[test]
+    fn rejects_probe_result_copied_field_descriptions_with_punctuation() {
+        let raw = r#"{
+  "status": "RequiresFurtherDiscovery",
+  "profile": "general",
+  "riskLevel": "high",
+  "summary": "task-specific assessment sentence.",
+  "criticalFailures": [],
+  "resolutionRequired": true,
+  "postTurnInstruction": "task-specific corrective instruction, or empty string when no resolution is required."
+}"#;
+
+        let err = parse_probe_review_result(raw)
+            .expect_err("copied field descriptions should not be accepted");
+
+        assert!(err.contains("summary"), "{err}");
+        assert!(err.contains("placeholder"), "{err}");
+    }
+
+    #[test]
+    fn rejects_probe_result_pipe_delimited_failure_category() {
+        let raw = r#"{
+  "status": "Inadequate",
+  "profile": "general",
+  "riskLevel": "high",
+  "summary": "The answer did not resolve the validation gap.",
+  "criticalFailures": [
+    {
+      "category": "framing | investigation | evidence | reasoning | confidence | output_goal | validation",
+      "claim": "The work is complete.",
+      "problem": "No validation command succeeded.",
+      "neededResolution": "Run the missing validation or downgrade the completion claim."
+    }
+  ],
+  "resolutionRequired": true,
+  "postTurnInstruction": "Run the missing validation or revise the conclusion."
+}"#;
+
+        let err = parse_probe_review_result(raw)
+            .expect_err("pipe-delimited placeholder category should not be accepted");
+
+        assert!(err.contains("category"), "{err}");
+        assert!(err.contains("placeholder"), "{err}");
     }
 }

@@ -218,8 +218,13 @@ fn promote_exec_cell_to_explore(chat: &mut ChatWidget<'_>, idx: usize) -> bool {
         return true;
     }
 
+    let started_at = segments
+        .first()
+        .map(|segment| segment.started_at)
+        .unwrap_or_else(SystemTime::now);
     let mut record = ExploreRecord {
         id: HistoryId::ZERO,
+        started_at,
         entries: Vec::new(),
     };
 
@@ -1249,6 +1254,7 @@ pub(super) fn handle_exec_begin_now(
             let key = chat.provider_order_key_from_order_meta(order);
             let record = ExploreRecord {
                 id: HistoryId::ZERO,
+                started_at: SystemTime::now(),
                 entries: Vec::new(),
             };
             let idx = chat.history_insert_with_key_global_tagged(
