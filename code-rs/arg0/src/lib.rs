@@ -74,6 +74,8 @@ where
         std::process::exit(exit_code);
     }
 
+    install_default_rustls_provider();
+
     // This modifies the environment, which is not thread-safe, so do this
     // before creating any threads/the Tokio runtime.
     load_dotenv();
@@ -103,6 +105,13 @@ where
 
         main_fn(code_linux_sandbox_exe).await
     })
+}
+
+fn install_default_rustls_provider() {
+    // The workspace can enable both rustls crypto backends through transitive
+    // reqwest/opentelemetry/websocket features. Pick one explicitly before any
+    // TLS client asks rustls to infer a process-wide provider.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 const ILLEGAL_ENV_VAR_PREFIX: &str = "CODEX_";
@@ -301,9 +310,41 @@ fn path_has_standard_dirs(_path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::sync::Mutex;
 
     static PATH_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn arg0_dispatch_installs_rustls_provider_before_main() {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg("tests::arg0_dispatch_installs_rustls_provider_before_main_child")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .output()
+            .expect("spawn child test");
+
+        if !output.status.success() {
+            panic!(
+                "child test failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+
+    #[ignore]
+    #[test]
+    fn arg0_dispatch_installs_rustls_provider_before_main_child() {
+        arg0_dispatch_or_else(|_| async {
+            assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+            let _ = rustls::ClientConfig::builder();
+            Ok(())
+        })
+        .expect("arg0 dispatch succeeds");
+    }
 
     #[test]
     fn prepend_path_seeds_default_when_missing() {

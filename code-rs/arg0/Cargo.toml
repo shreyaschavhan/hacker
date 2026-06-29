@@ -16,5 +16,6 @@ code-apply-patch = { workspace = true }
 code-core = { workspace = true }
 code-linux-sandbox = { workspace = true }
 dotenvy = { workspace = true }
+rustls = { version = "0.23.34", default-features = false, features = ["aws_lc_rs", "std"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
