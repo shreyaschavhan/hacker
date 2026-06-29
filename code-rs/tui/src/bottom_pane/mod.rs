@@ -19,7 +19,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::WidgetRef;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod approval_modal_view;
 #[cfg(feature = "code-fork")]
@@ -130,9 +130,9 @@ struct StatusIndicatorView {
 }
 
 impl StatusIndicatorView {
-    fn new(app_event_tx: AppEventSender) -> Self {
+    fn new(app_event_tx: AppEventSender, start_time: Instant) -> Self {
         Self {
-            indicator: StatusIndicatorWidget::new(app_event_tx),
+            indicator: StatusIndicatorWidget::new_with_start_time(app_event_tx, start_time),
         }
     }
 }
@@ -286,6 +286,9 @@ impl BottomPane<'_> {
     }
 
     fn show_status_view_if_available(&mut self) {
+        if self.status_view_active {
+            return;
+        }
         if self.active_view_kind == ActiveViewKind::AutoCoordinator {
             return;
         }
@@ -293,7 +296,11 @@ impl BottomPane<'_> {
             return;
         }
 
-        let mut view = StatusIndicatorView::new(self.app_event_tx.clone());
+        let start_time = self
+            .composer
+            .task_running_started_at()
+            .unwrap_or_else(Instant::now);
+        let mut view = StatusIndicatorView::new(self.app_event_tx.clone(), start_time);
         if let Some(status) = self.composer.status_message() {
             let _ = view.update_status_text(status.to_string());
         }

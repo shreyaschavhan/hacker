@@ -4435,8 +4435,8 @@ impl ChatWidget<'_> {
         }
         if !self.bottom_pane.is_task_running() {
             tracing::debug!("Activity without spinner; re-enabling (reason: {reason})");
-            self.bottom_pane.set_task_running(true);
         }
+        self.bottom_pane.set_task_running(true);
     }
 
     #[inline]
@@ -36629,6 +36629,121 @@ use code_core::protocol::OrderMeta;
         assert!(
             frame.contains("Coding") || frame.contains("Using tools") || frame.contains("Working"),
             "patch begin should show a nonblank working title:\n{frame}"
+        );
+    }
+
+    #[test]
+    fn patch_apply_begin_restores_live_working_row_after_modal_hides_it() {
+        let _rt = enter_test_runtime_guard();
+        let mut harness = ChatWidgetHarness::new();
+        {
+            let chat = harness.chat();
+            reset_history(chat);
+        }
+
+        harness.handle_event(Event {
+            id: "turn-1".to_string(),
+            event_seq: 0,
+            msg: EventMsg::TaskStarted,
+            order: None,
+        });
+        {
+            let chat = harness.chat();
+            let ticket = chat.make_background_before_next_output_ticket();
+            chat.bottom_pane.push_approval_request(
+                ApprovalRequest::Exec {
+                    id: "approval-1".to_string(),
+                    command: vec!["echo".to_string(), "ok".to_string()],
+                    reason: Some("test approval".to_string()),
+                },
+                ticket,
+            );
+            chat.bottom_pane.close_approval_modal_view();
+            assert!(
+                chat.bottom_pane.is_task_running(),
+                "closing a modal should not mark the active task complete"
+            );
+        }
+
+        harness.handle_event(Event {
+            id: "patch-begin".to_string(),
+            event_seq: 1,
+            msg: EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
+                call_id: "patch-1".to_string(),
+                auto_approved: true,
+                changes: HashMap::new(),
+            }),
+            order: Some(OrderMeta {
+                request_ordinal: 1,
+                output_index: Some(0),
+                sequence_number: Some(0),
+            }),
+        });
+        harness.flush_into_widget();
+
+        let frame = crate::test_helpers::render_chat_widget_to_vt100(&mut harness, 96, 24);
+        assert!(
+            frame.contains("Working (") && frame.contains("s • esc to interrupt"),
+            "file-update work should restore the persistent live working row:\n{frame}"
+        );
+    }
+
+    #[test]
+    fn exec_begin_restores_live_working_row_after_modal_hides_it() {
+        let _rt = enter_test_runtime_guard();
+        let mut harness = ChatWidgetHarness::new();
+        {
+            let chat = harness.chat();
+            reset_history(chat);
+        }
+
+        harness.handle_event(Event {
+            id: "turn-1".to_string(),
+            event_seq: 0,
+            msg: EventMsg::TaskStarted,
+            order: None,
+        });
+        {
+            let chat = harness.chat();
+            let ticket = chat.make_background_before_next_output_ticket();
+            chat.bottom_pane.push_approval_request(
+                ApprovalRequest::Exec {
+                    id: "approval-1".to_string(),
+                    command: vec!["echo".to_string(), "ok".to_string()],
+                    reason: Some("test approval".to_string()),
+                },
+                ticket,
+            );
+            chat.bottom_pane.close_approval_modal_view();
+            assert!(
+                chat.bottom_pane.is_task_running(),
+                "closing a modal should not mark the active task complete"
+            );
+        }
+
+        harness.handle_event(Event {
+            id: "exec-1".to_string(),
+            event_seq: 1,
+            msg: EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                call_id: "exec-1".to_string(),
+                command: vec!["bash".into(), "-lc".into(), "sleep 30".into()],
+                cwd: std::env::temp_dir(),
+                parsed_cmd: vec![ParsedCommand::Unknown {
+                    cmd: "sleep 30".to_string(),
+                }],
+            }),
+            order: Some(OrderMeta {
+                request_ordinal: 1,
+                output_index: Some(0),
+                sequence_number: Some(0),
+            }),
+        });
+        harness.flush_into_widget();
+
+        let frame = crate::test_helpers::render_chat_widget_to_vt100(&mut harness, 96, 24);
+        assert!(
+            frame.contains("Working (") && frame.contains("s • esc to interrupt"),
+            "tool execution should restore the persistent live working row:\n{frame}"
         );
     }
 

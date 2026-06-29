@@ -426,6 +426,14 @@ impl ChatComposer {
             .map(|started| Instant::now().saturating_duration_since(started))
     }
 
+    pub(crate) fn task_running_started_at(&self) -> Option<Instant> {
+        if self.is_task_running {
+            self.status_started_at
+        } else {
+            None
+        }
+    }
+
     fn format_running_elapsed(duration: Duration) -> String {
         let total_secs = duration.as_secs();
         let hours = total_secs / 3600;

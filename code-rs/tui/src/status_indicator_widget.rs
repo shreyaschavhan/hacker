@@ -36,10 +36,14 @@ pub(crate) struct StatusIndicatorWidget {
 #[allow(dead_code)]
 impl StatusIndicatorWidget {
     pub(crate) fn new(app_event_tx: AppEventSender) -> Self {
+        Self::new_with_start_time(app_event_tx, Instant::now())
+    }
+
+    pub(crate) fn new_with_start_time(app_event_tx: AppEventSender, start_time: Instant) -> Self {
         Self {
             header: String::from("Working"),
             queued_messages: Vec::new(),
-            start_time: Instant::now(),
+            start_time,
             last_schedule: Cell::new(Instant::now()),
             last_rendered_second: Cell::new(u64::MAX),
 
