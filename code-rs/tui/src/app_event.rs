@@ -672,6 +672,7 @@ pub(crate) enum AppEvent {
         ack: Redacted<StdSender<TerminalCommandGate>>,
     },
     TerminalApprovalDecision { id: u64, approved: bool },
+    ProbeReviewApprovalDecision { id: u64, approved: bool },
     StartAutoDriveCelebration {
         message: Option<String>,
     },

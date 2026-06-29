@@ -76,6 +76,10 @@ impl<'a> BottomPaneView<'a> for ApprovalModalView<'a> {
         (&self.current).render_ref(area, buf);
     }
 
+    fn is_approval_modal(&self) -> bool {
+        true
+    }
+
     fn try_consume_approval_request(
         &mut self,
         req: ApprovalRequest,

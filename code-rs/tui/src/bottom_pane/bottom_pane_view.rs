@@ -57,6 +57,10 @@ pub(crate) trait BottomPaneView<'a> {
         None
     }
 
+    fn is_approval_modal(&self) -> bool {
+        false
+    }
+
     /// Update the status indicator text.
     fn update_status_text(&mut self, _text: String) -> ConditionalUpdate {
         ConditionalUpdate::NoRedraw

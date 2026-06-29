@@ -961,6 +961,21 @@ impl BottomPane<'_> {
         self.status_view_active = false;
     }
 
+    pub(crate) fn close_approval_modal_view(&mut self) {
+        let should_close = self
+            .active_view
+            .as_ref()
+            .is_some_and(|view| view.is_approval_modal());
+        if !should_close {
+            return;
+        }
+
+        self.active_view = None;
+        self.active_view_kind = ActiveViewKind::None;
+        self.set_standard_terminal_hint(None);
+        self.status_view_active = false;
+    }
+
     /// Show a generic list selection popup with items and actions.
     pub fn show_list_selection(
         &mut self,

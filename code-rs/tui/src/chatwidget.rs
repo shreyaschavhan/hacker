@@ -229,7 +229,7 @@ use crate::chatwidget::message::UserMessage;
 use crate::probe_review::{
     ProbeProfile, ProbeReviewResult, ProbeTurnState, build_probe_package, build_probe_prompt,
     detect_probe_trigger, parse_probe_review_result, post_turn_resolution_instruction,
-    probe_notice_lines, risk_meets_threshold,
+    probe_notice_lines, probe_resolution_developer_note, risk_meets_threshold,
 };
 use crate::history::compat::{
     ContextBrowserSnapshotRecord,
@@ -1319,6 +1319,12 @@ struct ProbeReviewRunState {
 }
 
 #[derive(Clone, Debug)]
+struct PendingProbeReviewPermission {
+    id: u64,
+    prompt: String,
+}
+
+#[derive(Clone, Debug)]
 struct PendingAutoReviewRange {
     base: GhostCommit,
     defer_until_turn: Option<u64>,
@@ -2031,6 +2037,8 @@ pub(crate) struct ChatWidget<'a> {
     auto_review_processed_evicted_total: u64,
     probe_review_turn: ProbeTurnState,
     probe_review_run: Option<ProbeReviewRunState>,
+    probe_review_permission: Option<PendingProbeReviewPermission>,
+    next_probe_review_permission_id: u64,
     processed_probe_review_agents: HashSet<String>,
     processed_probe_review_agent_order: VecDeque<String>,
     // New: coordinator-provided hints for the next Auto turn
@@ -7191,6 +7199,8 @@ impl ChatWidget<'_> {
             auto_review_processed_evicted_total: 0,
             probe_review_turn: ProbeTurnState::default(),
             probe_review_run: None,
+            probe_review_permission: None,
+            next_probe_review_permission_id: 1,
             processed_probe_review_agents: HashSet::new(),
             processed_probe_review_agent_order: VecDeque::new(),
             pending_turn_descriptor: None,
@@ -7586,6 +7596,8 @@ impl ChatWidget<'_> {
             auto_review_processed_evicted_total: 0,
             probe_review_turn: ProbeTurnState::default(),
             probe_review_run: None,
+            probe_review_permission: None,
+            next_probe_review_permission_id: 1,
             processed_probe_review_agents: HashSet::new(),
             processed_probe_review_agent_order: VecDeque::new(),
             pending_turn_descriptor: None,
@@ -14493,6 +14505,9 @@ impl ChatWidget<'_> {
                 // after every tool call.
                 self.turn_sequence = self.turn_sequence.saturating_add(1);
                 self.turn_had_code_edits = false;
+                self.cancel_pending_probe_review_permission(
+                    "Probe Review: cancelled because a new task started before approval.",
+                );
                 self.probe_review_turn.reset_for_turn();
                 self.current_task_lifecycle = self.pending_task_lifecycle.take();
                 self.current_turn_origin = if self.current_task_output_is_hidden() {
@@ -31166,6 +31181,10 @@ static AUTO_REVIEW_STUB: once_cell::sync::Lazy<std::sync::Mutex<Option<Box<dyn F
     once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
 
 #[cfg(test)]
+static PROBE_REVIEW_STUB: once_cell::sync::Lazy<std::sync::Mutex<Option<Box<dyn FnMut(String) + Send>>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
 struct AutoReviewStubGuard;
 
 #[cfg(test)]
@@ -31181,6 +31200,27 @@ impl AutoReviewStubGuard {
 impl Drop for AutoReviewStubGuard {
     fn drop(&mut self) {
         if let Ok(mut guard) = AUTO_REVIEW_STUB.lock() {
+            *guard = None;
+        }
+    }
+}
+
+#[cfg(test)]
+struct ProbeReviewStubGuard;
+
+#[cfg(test)]
+impl ProbeReviewStubGuard {
+    fn install<F: FnMut(String) + Send + 'static>(f: F) -> Self {
+        let mut guard = PROBE_REVIEW_STUB.lock().unwrap();
+        *guard = Some(Box::new(f));
+        ProbeReviewStubGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProbeReviewStubGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = PROBE_REVIEW_STUB.lock() {
             *guard = None;
         }
     }
@@ -32134,6 +32174,236 @@ use code_core::protocol::OrderMeta;
         assert!(note.contains("Background auto-review completed and reported 1 issue(s)"));
         assert!(note.contains("Merge the worktree 'auto-review-branch'"));
         assert_no_code_ops_pending(&mut code_op_rx);
+    }
+
+    #[test]
+    fn probe_review_resolution_required_emits_contextual_post_turn_input() {
+        let _rt = enter_test_runtime_guard();
+        let mut harness = ChatWidgetHarness::new();
+        let chat = harness.chat();
+        let mut code_op_rx = replace_code_op_channel(chat);
+
+        chat.config.probe_review.auto_resolve = true;
+        chat.handle_probe_review_result(ProbeReviewResult {
+            status: "PartiallyAdequate".to_string(),
+            profile: "general".to_string(),
+            risk_level: "high".to_string(),
+            summary: "The final answer claimed validation passed, but the turn recorded no validation signals.".to_string(),
+            critical_failures: vec![crate::probe_review::ProbeCriticalFailure {
+                category: "validation gap".to_string(),
+                claim: "The task is complete and validated.".to_string(),
+                problem: "The process package has zero validation signals, so the completion claim is unsupported.".to_string(),
+                needed_resolution: "Run validation or downgrade the completion claim before treating it as stable.".to_string(),
+            }],
+            resolution_required: true,
+            post_turn_instruction: Some(
+                "Resolve the validation gap before treating the completion claim as stable."
+                    .to_string(),
+            ),
+        });
+
+        assert!(
+            history_contains_text(chat, "Probe Review: resolution required"),
+            "probe findings should render a visible notice"
+        );
+        let note = expect_post_turn_developer_input(&mut code_op_rx);
+        assert!(note.contains("Probe Review: resolution required"));
+        assert!(note.contains("The final answer claimed validation passed"));
+        assert!(note.contains("validation gap"));
+        assert!(note.contains("zero validation signals"));
+        assert!(note.contains("Run validation or downgrade the completion claim"));
+        assert!(note.contains("Resolve the validation gap before treating the completion claim as stable."));
+        assert_no_code_ops_pending(&mut code_op_rx);
+    }
+
+    #[test]
+    fn probe_review_resolution_instruction_survives_context_truncation() {
+        let _rt = enter_test_runtime_guard();
+        let mut harness = ChatWidgetHarness::new();
+        let chat = harness.chat();
+        let mut code_op_rx = replace_code_op_channel(chat);
+
+        chat.config.probe_review.auto_resolve = true;
+        let verbose = "verbose probe context ".repeat(MAX_PENDING_AUTO_REVIEW_NOTE_CHARS);
+        let instruction = "Resolve the concrete validation gap before proceeding.";
+        chat.handle_probe_review_result(ProbeReviewResult {
+            status: "PartiallyAdequate".to_string(),
+            profile: "general".to_string(),
+            risk_level: "high".to_string(),
+            summary: verbose.clone(),
+            critical_failures: vec![crate::probe_review::ProbeCriticalFailure {
+                category: "validation gap".to_string(),
+                claim: verbose.clone(),
+                problem: verbose,
+                needed_resolution: "Run the missing validation before claiming completion.".to_string(),
+            }],
+            resolution_required: true,
+            post_turn_instruction: Some(instruction.to_string()),
+        });
+
+        let note = expect_post_turn_developer_input(&mut code_op_rx);
+        assert!(
+            note.contains(instruction),
+            "auto-resolve note should preserve the concrete post-turn instruction"
+        );
+        assert_no_code_ops_pending(&mut code_op_rx);
+    }
+
+    fn seed_high_risk_probe_turn(chat: &mut ChatWidget<'static>) {
+        chat.probe_review_turn = ProbeTurnState {
+            final_answer: Some("The SSRF is confirmed and report ready.".to_string()),
+            tool_calls: 4,
+            failed_tool_calls: 0,
+            validation_signals: 0,
+            file_change_events: 0,
+            agent_events: 1,
+            force_requested: false,
+        };
+    }
+
+    #[test]
+    fn probe_review_requests_permission_before_running_and_runs_after_approval() {
+        let _stub_lock = AUTO_STUB_LOCK.lock().unwrap();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let launches_for_stub = Arc::clone(&launches);
+        let prompts_for_stub = Arc::clone(&prompts);
+        let _stub = ProbeReviewStubGuard::install(move |prompt| {
+            launches_for_stub.fetch_add(1, Ordering::SeqCst);
+            prompts_for_stub.lock().unwrap().push(prompt);
+        });
+        let mut harness = ChatWidgetHarness::new();
+        let chat = harness.chat();
+        seed_high_risk_probe_turn(chat);
+
+        chat.maybe_trigger_probe_review();
+
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert!(chat.probe_review_run.is_none());
+        assert!(chat.probe_review_permission.is_some());
+        assert!(chat.bottom_pane.has_active_view());
+        let id = chat.probe_review_permission.as_ref().unwrap().id;
+
+        chat.handle_probe_review_approval_decision(id, true);
+
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert!(chat.probe_review_permission.is_none());
+        assert!(chat.probe_review_run.is_some());
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("The SSRF is confirmed and report ready."));
+    }
+
+    #[test]
+    fn probe_review_denial_blocks_execution() {
+        let _stub_lock = AUTO_STUB_LOCK.lock().unwrap();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let launches_for_stub = Arc::clone(&launches);
+        let _stub = ProbeReviewStubGuard::install(move |_| {
+            launches_for_stub.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut harness = ChatWidgetHarness::new();
+        let chat = harness.chat();
+        seed_high_risk_probe_turn(chat);
+
+        chat.maybe_trigger_probe_review();
+        let id = chat.probe_review_permission.as_ref().unwrap().id;
+        chat.handle_probe_review_approval_decision(id, false);
+
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert!(chat.probe_review_permission.is_none());
+        assert!(chat.probe_review_run.is_none());
+        assert!(history_contains_text(
+            chat,
+            "Probe Review: cancelled because permission was not granted."
+        ));
+    }
+
+    #[test]
+    fn probe_review_cancelled_permission_blocks_execution() {
+        let _stub_lock = AUTO_STUB_LOCK.lock().unwrap();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let launches_for_stub = Arc::clone(&launches);
+        let _stub = ProbeReviewStubGuard::install(move |_| {
+            launches_for_stub.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut harness = ChatWidgetHarness::new();
+        let chat = harness.chat();
+        seed_high_risk_probe_turn(chat);
+
+        chat.maybe_trigger_probe_review();
+        chat.cancel_pending_probe_review_permission("Probe Review: cancelled before approval.");
+
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert!(chat.probe_review_permission.is_none());
+        assert!(chat.probe_review_run.is_none());
+        assert!(history_contains_text(chat, "Probe Review: cancelled before approval."));
+    }
+
+    #[test]
+    fn probe_review_ambiguous_or_stale_permission_does_not_run() {
+        let _stub_lock = AUTO_STUB_LOCK.lock().unwrap();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let launches_for_stub = Arc::clone(&launches);
+        let _stub = ProbeReviewStubGuard::install(move |_| {
+            launches_for_stub.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut harness = ChatWidgetHarness::new();
+        let chat = harness.chat();
+        seed_high_risk_probe_turn(chat);
+
+        chat.maybe_trigger_probe_review();
+        let id = chat.probe_review_permission.as_ref().unwrap().id;
+        chat.handle_probe_review_approval_decision(id.saturating_add(1), true);
+
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert!(chat.probe_review_permission.is_some());
+        assert!(chat.probe_review_run.is_none());
+    }
+
+    #[test]
+    fn probe_review_retry_requests_fresh_permission_after_denial() {
+        let _stub_lock = AUTO_STUB_LOCK.lock().unwrap();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let launches_for_stub = Arc::clone(&launches);
+        let _stub = ProbeReviewStubGuard::install(move |_| {
+            launches_for_stub.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut harness = ChatWidgetHarness::new();
+        let chat = harness.chat();
+        seed_high_risk_probe_turn(chat);
+
+        chat.maybe_trigger_probe_review();
+        let first_id = chat.probe_review_permission.as_ref().unwrap().id;
+        chat.handle_probe_review_approval_decision(first_id, false);
+        seed_high_risk_probe_turn(chat);
+        chat.maybe_trigger_probe_review();
+
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        let second_id = chat.probe_review_permission.as_ref().unwrap().id;
+        assert_ne!(first_id, second_id);
+    }
+
+    #[test]
+    fn probe_review_duplicate_trigger_does_not_queue_without_decision() {
+        let _stub_lock = AUTO_STUB_LOCK.lock().unwrap();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let launches_for_stub = Arc::clone(&launches);
+        let _stub = ProbeReviewStubGuard::install(move |_| {
+            launches_for_stub.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut harness = ChatWidgetHarness::new();
+        let chat = harness.chat();
+        seed_high_risk_probe_turn(chat);
+
+        chat.maybe_trigger_probe_review();
+        let first_id = chat.probe_review_permission.as_ref().unwrap().id;
+        seed_high_risk_probe_turn(chat);
+        chat.maybe_trigger_probe_review();
+
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        let second_id = chat.probe_review_permission.as_ref().unwrap().id;
+        assert_eq!(first_id, second_id);
     }
 
     #[test]
@@ -37874,6 +38144,9 @@ impl ChatWidget<'_> {
         if self.current_task_should_skip_auto_review() {
             return;
         }
+        if self.probe_review_permission.is_some() {
+            return;
+        }
 
         if let Some(run) = self.probe_review_run.as_ref() {
             if run.last_seen.elapsed().as_secs() < AUTO_REVIEW_STALE_SECS {
@@ -37917,8 +38190,66 @@ impl ChatWidget<'_> {
         }
 
         let package = build_probe_package(&self.probe_review_turn, &trigger);
-        let prompt = build_probe_prompt(&package);
-        self.launch_probe_review(prompt);
+        let prompt = build_probe_prompt(&package, &self.config.cwd);
+        self.request_probe_review_permission(prompt, &trigger);
+    }
+
+    fn request_probe_review_permission(&mut self, prompt: String, trigger: &crate::probe_review::ProbeTrigger) {
+        let id = self.next_probe_review_permission_id;
+        self.next_probe_review_permission_id = self.next_probe_review_permission_id.saturating_add(1);
+        let profile = trigger.profile.as_str().to_string();
+        let risk_level = trigger.risk_level.as_str().to_string();
+        let reasons = trigger.reasons.clone();
+        self.probe_review_permission = Some(PendingProbeReviewPermission {
+            id,
+            prompt,
+        });
+
+        let ticket = self.make_background_before_next_output_ticket();
+        self.bottom_pane.push_approval_request(
+            ApprovalRequest::ProbeReview {
+                id,
+                profile,
+                risk_level,
+                reasons,
+            },
+            ticket,
+        );
+        self.request_redraw();
+    }
+
+    pub(crate) fn handle_probe_review_approval_decision(&mut self, id: u64, approved: bool) {
+        let Some(pending) = self.probe_review_permission.as_ref() else {
+            return;
+        };
+        if pending.id != id {
+            return;
+        }
+
+        let Some(pending) = self.probe_review_permission.take() else {
+            return;
+        };
+        if approved {
+            self.launch_probe_review(pending.prompt);
+            return;
+        }
+
+        self.history_push_plain_paragraphs(
+            PlainMessageKind::Notice,
+            ["Probe Review: cancelled because permission was not granted."],
+        );
+        self.clear_probe_review_indicator();
+        self.request_redraw();
+    }
+
+    fn cancel_pending_probe_review_permission<S: Into<String>>(&mut self, message: S) {
+        if self.probe_review_permission.take().is_none() {
+            return;
+        }
+        self.bottom_pane.close_approval_modal_view();
+        self.history_push_plain_paragraphs(PlainMessageKind::Notice, [message.into()]);
+        self.clear_probe_review_indicator();
+        self.request_redraw();
     }
 
     fn launch_probe_review(&mut self, prompt: String) {
@@ -37927,6 +38258,12 @@ impl ChatWidget<'_> {
             last_seen: std::time::Instant::now(),
         });
         self.set_probe_review_indicator(AutoReviewIndicatorStatus::Running, None);
+
+        #[cfg(test)]
+        if let Some(stub) = PROBE_REVIEW_STUB.lock().unwrap().as_mut() {
+            (stub)(prompt);
+            return;
+        }
 
         let config = self.config.clone();
         tokio::spawn(async move {
@@ -38330,8 +38667,9 @@ impl ChatWidget<'_> {
         let Some(instruction) = post_turn_resolution_instruction(&result) else {
             return;
         };
+        let developer_note = probe_resolution_developer_note(&result, &instruction);
         let bounded_note =
-            Self::truncate_with_ellipsis(instruction.trim(), MAX_PENDING_AUTO_REVIEW_NOTE_CHARS);
+            Self::truncate_with_ellipsis(developer_note.trim(), MAX_PENDING_AUTO_REVIEW_NOTE_CHARS);
         if bounded_note.trim().is_empty() {
             return;
         }
@@ -38813,6 +39151,19 @@ impl ChatWidget<'_> {
             self.auto_review_status,
             Some(AutoReviewStatus {
                 source: ReviewFooterSource::AutoReview,
+                ..
+            })
+        ) {
+            self.auto_review_status = None;
+            self.bottom_pane.set_auto_review_status(None);
+        }
+    }
+
+    fn clear_probe_review_indicator(&mut self) {
+        if matches!(
+            self.auto_review_status,
+            Some(AutoReviewStatus {
+                source: ReviewFooterSource::ProbeReview,
                 ..
             })
         ) {

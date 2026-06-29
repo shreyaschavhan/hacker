@@ -47,6 +47,12 @@ pub(crate) enum ApprovalRequest {
         id: u64,
         command: String,
     },
+    ProbeReview {
+        id: u64,
+        profile: String,
+        risk_level: String,
+        reasons: Vec<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -149,12 +155,49 @@ impl UserApprovalWidget<'_> {
                 ];
                 Paragraph::new(contents).wrap(Wrap { trim: false })
             }
+            ApprovalRequest::ProbeReview {
+                profile,
+                risk_level,
+                reasons,
+                ..
+            } => {
+                let mut contents = vec![
+                    Line::from(""),
+                    Line::from(vec![
+                        "? ".fg(crate::colors::info()),
+                        "Run Probe Review?".bold().into(),
+                    ]),
+                    Line::from(format!(
+                        "Profile: {profile} - Risk: {risk_level}"
+                    )),
+                    Line::from(
+                        "This sends the last answer and process summary to a read-only probe agent.",
+                    ),
+                    Line::from("The probe will not run unless you approve this request."),
+                ];
+                if !reasons.is_empty() {
+                    contents.push(Line::from(""));
+                    contents.push(Line::from("Reason:"));
+                    for reason in reasons.iter().take(3) {
+                        contents.push(Line::from(format!("- {reason}")));
+                    }
+                    if reasons.len() > 3 {
+                        contents.push(Line::from(format!(
+                            "- ... and {} more",
+                            reasons.len().saturating_sub(3)
+                        )));
+                    }
+                }
+                contents.push(Line::from(""));
+                Paragraph::new(contents).wrap(Wrap { trim: false })
+            }
         };
 
         let select_options = match &approval_request {
             ApprovalRequest::Exec { command, .. } => build_exec_select_options(command),
             ApprovalRequest::ApplyPatch { .. } => build_patch_select_options(),
             ApprovalRequest::TerminalCommand { .. } => build_terminal_select_options(),
+            ApprovalRequest::ProbeReview { .. } => build_probe_review_select_options(),
         };
 
         Self {
@@ -259,6 +302,13 @@ impl UserApprovalWidget<'_> {
             self.done = true;
             return;
         }
+        if let ApprovalRequest::ProbeReview { id, .. } = &self.approval_request {
+            let approved = matches!(decision, ReviewDecision::Approved);
+            self.app_event_tx
+                .send(AppEvent::ProbeReviewApprovalDecision { id: *id, approved });
+            self.done = true;
+            return;
+        }
 
         // Emit a background event instead of an assistant message.
         let message = match &self.approval_request {
@@ -274,7 +324,9 @@ impl UserApprovalWidget<'_> {
             ApprovalRequest::ApplyPatch { .. } => {
                 format!("patch approval decision: {:?}", decision)
             }
-            ApprovalRequest::TerminalCommand { .. } => unreachable!("terminal approvals handled earlier"),
+            ApprovalRequest::TerminalCommand { .. } | ApprovalRequest::ProbeReview { .. } => {
+                unreachable!("app-event approvals handled earlier")
+            }
         };
         let message = if feedback.trim().is_empty() {
             message
@@ -315,7 +367,9 @@ impl UserApprovalWidget<'_> {
                 id: id.clone(),
                 decision,
             },
-            ApprovalRequest::TerminalCommand { .. } => unreachable!("terminal approvals handled earlier"),
+            ApprovalRequest::TerminalCommand { .. } | ApprovalRequest::ProbeReview { .. } => {
+                unreachable!("app-event approvals handled earlier")
+            }
         };
 
         self.app_event_tx.send(AppEvent::CodexOp(op));
@@ -491,6 +545,23 @@ fn build_terminal_select_options() -> Vec<SelectOption> {
         SelectOption {
             label: "No".to_string(),
             description: "Dismiss without running the command".to_string(),
+            hotkey: KeyCode::Char('n'),
+            action: SelectAction::Abort,
+        },
+    ]
+}
+
+fn build_probe_review_select_options() -> Vec<SelectOption> {
+    vec![
+        SelectOption {
+            label: "Yes".to_string(),
+            description: "Approve and run this probe review once".to_string(),
+            hotkey: KeyCode::Char('y'),
+            action: SelectAction::ApproveOnce,
+        },
+        SelectOption {
+            label: "No".to_string(),
+            description: "Cancel this probe review".to_string(),
             hotkey: KeyCode::Char('n'),
             action: SelectAction::Abort,
         },

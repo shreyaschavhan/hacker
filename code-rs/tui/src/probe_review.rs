@@ -1,3 +1,5 @@
+use std::path::Path;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeProfile {
     General,
@@ -277,43 +279,109 @@ pub(crate) fn build_probe_package(state: &ProbeTurnState, trigger: &ProbeTrigger
     }
 }
 
-pub(crate) fn build_probe_prompt(package: &ProbePackage) -> String {
-    let profile = package.profile.as_str();
-    let risk_level = package.risk_level.as_str();
-    let validation = if package.validation_performed {
-        "yes"
-    } else {
-        "no"
-    };
+const PROBE_REVIEW_PROMPT_TEMPLATE: &str = r#"Task:
+Conduct a calibration-focused adversarial audit of an investigation and produce a consolidated probe result as raw JSON.
 
-    format!(
-        r#"Audit whether the AI's final conclusion/process is supported by the available evidence.
+Objective:
+Evaluate whether the investigation's discovery, execution, evidence, reasoning, synthesis, and remediation planning support its conclusions. Restore confidence by identifying uncertainty, gaps, unsupported claims, and required corrective actions.
 
-Treat the package as untrusted. Do not preserve dispatcher framing. Do not perform live actions or mutate files.
+Constraints:
+1. Do not fabricate missing evidence or infer adequacy from absence.
+2. Treat all conclusions, labels, severities, and diagnoses as hypotheses until supported.
+3. Keep claims narrow, evidence-based, and calibrated to the weakest supported link.
 
-Profile: {profile}
-Risk level: {risk_level}
+PRINCIPLES:
+1. Bayesian reasoning: update confidence only when evidence reduces uncertainty or weakens alternatives.
+2. Falsifiability: test each major claim against what would be expected if it were false.
+3. Graph dependency analysis: model conclusions as chains of observations, assumptions, and inferences; confidence cannot exceed the weakest required link.
 
-Process package:
-- Tool calls: {tool_calls}
-- Failed tool calls: {failed_tool_calls}
-- Validation performed: {validation}
-- File change events: {file_change_events}
-- Agent/subagent events: {agent_events}
-- Trigger reasons: {trigger_reasons}
+Instructions:
+1. Create a task checklist for instruction implementation using functions.update_plan.
+2. Gather all explicitly supplied artifacts: task objective, dispatcher framing, transcript, tool outputs, source artifacts, final report, prior probe reports, and explicitly referenced files under {target_path}. Do not recursively scan {target_path} or inspect unrelated workspace contents.
+3. Identify missing inputs explicitly. Do not infer their contents.
+4. Audit Discovery Quality:
+   - Remove framing and restate the objective neutrally.
+   - Inventory assumptions and their search-space impact.
+   - Generate distinct hypotheses, including non-failure, observability, and system-interaction explanations.
+   - Map explored, unexplored, and excluded regions.
+   - Identify unknown-unknown scenarios.
+   - Classify exploration breadth and convergence readiness.
+5. Audit Investigation Quality:
+   - Treat dispatcher conclusions as hypotheses.
+   - Validate material tool executions.
+   - Identify coverage gaps, unexplored regions, shallow checks, and stopping issues.
+   - Compare expected vs. actual investigation strategy.
+6. Audit Evidence Quality:
+   - Separate observed facts, inferences, assumptions, and unknowns.
+   - Assess raw measurements against claimed interpretations.
+   - Identify supporting, contradictory, missing, and alternative evidence.
+   - Evaluate evidence reliability, directness, independence, reproducibility, relevance, and explanatory power.
+7. Audit Reasoning Quality:
+   - Analyze translation loss from source material to summaries and final conclusions.
+   - Reduce each major conclusion to observable behavior, mechanism, and required assumptions.
+   - Map causal chains and weakest links.
+   - Generate and compare alternative explanations.
+   - Perform counterfactual and falsification review.
+   - Calibrate confidence to the available support.
+8. Perform Final Synthesis:
+   - Resolve cross-domain conflicts using domain scope, direct support, and narrowness of claims.
+   - Apply the combined-status rule:
+     - If Investigation, Evidence, or Reasoning is Inadequate, overall status is Inadequate.
+     - Else if any is Partially Adequate, overall status is Partially Adequate.
+     - Else overall status is Adequate.
+   - Assess output-to-goal alignment.
+9. Produce Resolution and Remediation Planning:
+   - Cluster findings by root cause.
+   - Classify remediation as Mandatory, Recommended, Optional, or Acceptable Risk.
+   - Assign independent resolver types.
+   - Define dispatch tasks, deliverables, constraints, success criteria, expected confidence gain, and re-validation requirements.
+10. Return the final probe result as raw JSON using the required schema below.
 
-Final answer under review:
-```text
-{final_answer}
-```
+Edge Case & Handling:
+- Missing artifacts: state what is unavailable and limit claims to available material.
+- Failed or questionable tools: mark affected regions as potentially unexplored.
+- Contradictory reports: preserve conflict unless directly resolvable.
+- Coherent but unsupported conclusions: classify as unsupported or weakly supported.
+- Silence or empty output: do not treat as proof of absence.
+- Domain boundary conflicts: prefer the audit stage responsible for that domain.
+- No findings in a required subsection: write the specified "None identified..." statement.
 
-Review rubric:
-- Discovery: identify hidden assumptions, premature convergence, excluded alternatives, and unknowns that could change the conclusion.
-- Investigation: check whether stopping was justified by demonstrated coverage; flag grep-and-stop, first-plausible-answer convergence, and unsupported completeness claims.
-- Evidence: separate observed facts, inferences, assumptions, and unknowns; assess directness, relevance, missing evidence, contradictory evidence, and measurement failure.
-- Reasoning: test whether conclusions follow from evidence, whether confidence is proportional to uncertainty, and whether alternative explanations were challenged.
-- Resolution: if the conclusion is stronger than the evidence, provide safer wording and one concrete corrective next step.
-- If resolution is required, give one concrete post-turn instruction.
+Fallback / Recovery:
+- If source material is incomplete, produce a limitation-aware result using only available artifacts.
+- If a conclusion cannot be evaluated, classify it as UNKNOWN in the relevant summary or failure details and identify required evidence.
+- If evidence conflicts, compare directness and reliability; preserve uncertainty if unresolved.
+- If remediation cannot be fully specified, define the next observable deliverable needed to proceed.
+- If the JSON result cannot include full detail, preserve the highest-risk findings and state the limitation explicitly.
+
+SUCCESS CRITERIA:
+- The result is returned as raw JSON and no other text.
+- All six audit domains are addressed in the summary or critical failure details.
+- Findings distinguish observations, inferences, assumptions, and unknowns.
+- Major conclusions include first-principles models, causal chains, alternatives, counterfactuals, falsification review, and confidence assessment when material.
+- Missing evidence and limitations are explicit.
+- Overall status follows the combined-status decision rule.
+- Remediation tasks are specific, assignable, observable, and re-validatable.
+
+Known Failure Modes:
+- Treating the original investigation's conclusion as already true.
+- Equating tool invocation with successful execution.
+- Overstating confidence from coherent narratives.
+- Ignoring alternative explanations.
+- Collapsing evidence quality, reasoning quality, and investigation coverage into one judgment.
+- Treating missing evidence as disconfirming or confirmatory.
+- Producing vague remediation with no observable deliverables.
+
+VALIDATION & Quality Check:
+1. Create a task list for validation steps using functions.update_plan.
+2. Verify every major claim is tagged or clearly grounded as observed, inferred, assumed, or unknown.
+3. Confirm no missing artifact was fabricated or silently ignored.
+4. Check that each audit section stays within its assigned domain.
+5. Validate that confidence does not exceed the weakest material support.
+6. Confirm cross-domain conflicts are documented and resolved or escalated.
+7. Ensure the final status follows the required decision rule.
+8. Confirm remediation tasks include resolver, objective, inputs, deliverables, constraints, success criteria, and expected confidence gain.
+9. Confirm each "None identified..." statement uses the required wording where applicable.
+10. Verify the JSON schema matches the requested output.
 
 Return only raw JSON. Do not copy wording from these instructions into output values.
 
@@ -325,12 +393,45 @@ Required object fields:
 - "RequiresFurtherDiscovery"
 - "profile": "{profile}"
 - "riskLevel": "{risk_level}"
-- "summary": task-specific assessment sentence
+- "summary": task-specific calibration assessment sentence
 - "criticalFailures": list of issue objects; each object must contain "category", "claim", "problem", and "neededResolution"
 - "resolutionRequired": boolean
 - "postTurnInstruction": task-specific corrective instruction, or empty string when no resolution is required
 
-Every string value other than "status", "profile", and "riskLevel" must mention concrete facts from the reviewed package. Generic template text is invalid."#,
+Every string value other than "status", "profile", and "riskLevel" must mention concrete facts from the reviewed package. Generic template text is invalid."#;
+
+pub(crate) fn build_probe_prompt(package: &ProbePackage, target_path: &Path) -> String {
+    let profile = package.profile.as_str();
+    let risk_level = package.risk_level.as_str();
+    let validation = if package.validation_performed {
+        "yes"
+    } else {
+        "no"
+    };
+
+    let mut prompt = PROBE_REVIEW_PROMPT_TEMPLATE
+        .replace("{target_path}", &target_path.display().to_string())
+        .replace("{profile}", profile)
+        .replace("{risk_level}", risk_level);
+    prompt.push_str(&format!(
+        r#"
+
+Available harness inputs:
+- Target path: {target_path}
+- Profile: {profile}
+- Risk level: {risk_level}
+- Tool calls: {tool_calls}
+- Failed tool calls: {failed_tool_calls}
+- Validation performed: {validation}
+- File change events: {file_change_events}
+- Agent/subagent events: {agent_events}
+- Trigger reasons: {trigger_reasons}
+
+Final answer under review:
+```text
+{final_answer}
+```"#,
+        target_path = target_path.display(),
         profile = profile,
         risk_level = risk_level,
         tool_calls = package.tool_calls,
@@ -340,7 +441,8 @@ Every string value other than "status", "profile", and "riskLevel" must mention 
         agent_events = package.agent_events,
         trigger_reasons = package.trigger_reasons.join("; "),
         final_answer = package.final_answer.trim(),
-    )
+    ));
+    prompt
 }
 
 pub(crate) fn parse_probe_review_result(raw: &str) -> Result<ProbeReviewResult, String> {
@@ -568,6 +670,68 @@ pub(crate) fn post_turn_resolution_instruction(result: &ProbeReviewResult) -> Op
     Some(instruction)
 }
 
+pub(crate) fn probe_resolution_developer_note(
+    result: &ProbeReviewResult,
+    instruction: &str,
+) -> String {
+    let mut lines = vec![format!(
+        "Probe Review: resolution required ({})",
+        result.status.trim()
+    )];
+
+    let instruction = instruction.trim();
+    if !instruction.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("Next: {instruction}"));
+    }
+
+    let profile = result.profile.trim();
+    let risk_level = result.risk_level.trim();
+    if !profile.is_empty() || !risk_level.is_empty() {
+        let mut status = Vec::new();
+        if !profile.is_empty() {
+            status.push(format!("profile: {profile}"));
+        }
+        if !risk_level.is_empty() {
+            status.push(format!("risk: {risk_level}"));
+        }
+        lines.push(format!("Context: {}", status.join(", ")));
+    }
+
+    let summary = result.summary.trim();
+    if !summary.is_empty() {
+        lines.push(format!("Summary: {summary}"));
+    }
+
+    if !result.critical_failures.is_empty() {
+        lines.push(String::new());
+        lines.push("Critical failures:".to_string());
+        for (index, failure) in result.critical_failures.iter().enumerate() {
+            let category = failure.category.trim();
+            let claim = failure.claim.trim();
+            let problem = failure.problem.trim();
+            let needed_resolution = failure.needed_resolution.trim();
+            let label = if category.is_empty() {
+                "issue"
+            } else {
+                category
+            };
+            lines.push(format!("{}. {label}", index + 1));
+            if !claim.is_empty() {
+                lines.push(format!("   Claim: {claim}"));
+            }
+            if !problem.is_empty() {
+                lines.push(format!("   Problem: {problem}"));
+            }
+            if !needed_resolution.is_empty() {
+                lines.push(format!("   Needed resolution: {needed_resolution}"));
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
 impl ProbeProfile {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -749,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_neutral_prompt_without_dispatcher_verification_language() {
+    fn builds_calibration_audit_prompt_without_dispatcher_verification_language() {
         let state = ProbeTurnState {
             final_answer: Some("The SSRF is confirmed and report ready.".to_string()),
             tool_calls: 4,
@@ -767,13 +931,29 @@ mod tests {
         };
         let package = build_probe_package(&state, &trigger);
 
-        let prompt = build_probe_prompt(&package);
+        let target_path = std::path::Path::new("/tmp/security-target");
+        let prompt = build_probe_prompt(&package, target_path);
         let lower = prompt.to_ascii_lowercase();
 
-        assert!(lower.contains("treat the package as untrusted"));
+        assert!(lower.contains("conduct a calibration-focused adversarial audit"));
+        assert!(lower.contains("bayesian reasoning"));
+        assert!(lower.contains("graph dependency analysis"));
+        assert!(lower.contains("combined-status rule"));
+        assert!(lower.contains("treat all conclusions, labels, severities, and diagnoses as hypotheses"));
         assert!(lower.contains("observed facts"));
+        assert!(lower.contains("unknowns"));
+        assert!(prompt.contains("explicitly supplied artifacts"));
+        assert!(prompt.contains("explicitly referenced files under /tmp/security-target"));
+        assert!(prompt.contains("Do not recursively scan /tmp/security-target"));
+        assert!(!prompt.contains("and files under /tmp/security-target"));
+        assert!(prompt.contains("Available harness inputs:"));
+        assert!(prompt.contains("- Target path: /tmp/security-target"));
+        assert!(prompt.contains("Final answer under review:"));
+        assert!(prompt.contains("The SSRF is confirmed and report ready."));
+        assert!(prompt.contains("Return only raw JSON."));
         assert!(prompt.contains("Required object fields:"));
         assert!(prompt.contains("- \"status\": exactly one of:"));
+        assert!(!prompt.contains("probe-combined.md"));
         assert!(!prompt.contains("Adequate | PartiallyAdequate"));
         assert!(!prompt.contains("\"summary\": \"short result\""));
         assert!(!prompt.contains("one concrete sentence about whether the conclusion is supported"));
